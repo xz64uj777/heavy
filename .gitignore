@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-helios/
+android/.gradle/
+android/local.properties
+android/app/build/
+android/app/*.jks
+android/app/src/main/assets/
+*.apk
+.DS_Store

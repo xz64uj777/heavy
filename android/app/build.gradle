@@ -1,0 +1,50 @@
+plugins {
+    id "com.android.application"
+}
+
+def keystoreFile = file("helios.jks")
+
+android {
+    namespace "com.lumendynamics.helios"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.lumendynamics.helios"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    signingConfigs {
+        release {
+            storeFile keystoreFile
+            storePassword "heliosheavy"
+            keyAlias "helios"
+            keyPassword "heliosheavy"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    androidResources {
+        noCompress += ["html", "js", "css", "svg", "json", "woff2"]
+    }
+}
+
+dependencies {
+    implementation "androidx.webkit:webkit:1.11.0"
+}

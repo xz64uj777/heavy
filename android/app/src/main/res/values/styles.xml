@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Helios" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/helios_bg</item>
+        <item name="android:statusBarColor">@color/helios_bg</item>
+        <item name="android:navigationBarColor">@color/helios_bg</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+    <color name="helios_bg">#07080c</color>
+    <color name="ic_launcher_bg">#11141c</color>
+</resources>
