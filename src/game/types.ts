@@ -125,6 +125,7 @@ export type EndState = {
 };
 
 export type Sim = {
+  practice?: "orbit" | "dock" | "landing";
   config: MissionConfig;
   phase: SimPhase;
   ended: EndState | null;
@@ -215,6 +216,9 @@ export type Sim = {
 export type FuelBar = { name: string; frac: number; active: boolean };
 
 export type HudSnapshot = {
+  practice?: "orbit" | "dock" | "landing";
+  flightCue: string;
+  steeringCue: string;
   met: number;
   phase: SimPhase;
   event: string;
