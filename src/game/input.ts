@@ -39,6 +39,7 @@ export class Input {
   injected: string[] | null = null;
   injectedSteer: number | null = null;
   private edges = new Set<string>();
+  private pressed = new Set<string>();
   private prev = new Set<string>();
   touchPitch = 0;
   touchThrottle: number | null = null;
@@ -70,6 +71,7 @@ export class Input {
       this.keys.clear();
       this.prev.clear();
       this.edges.clear();
+      this.pressed.clear();
       this.touchPitch = 0;
       this.touchThrottle = null;
       this.touchStage = false;
@@ -88,6 +90,7 @@ export class Input {
       // player clicks the canvas again.
       if (isInteractiveTarget(e.target)) return;
       if (GAME_CODES.has(e.code)) e.preventDefault();
+      if (!this.keys.has(e.code)) this.pressed.add(e.code);
       this.keys.add(e.code);
     };
     const up = (e: KeyboardEvent) => {
@@ -122,12 +125,12 @@ export class Input {
         pinchDist = 0;
         return;
       }
-      if (isInteractiveTarget(e.target)) return;
+      if (!Array.from(e.touches).every(t => t.target instanceof HTMLCanvasElement)) return;
       pinchDist = touchDist(e);
     };
     const pinchMove = (e: TouchEvent) => {
       if (e.touches.length !== 2 || pinchDist < 8) return;
-      if (isInteractiveTarget(e.target)) return;
+      if (!Array.from(e.touches).every(t => t.target instanceof HTMLCanvasElement)) { pinchDist = 0; return; }
       e.preventDefault();
       const d = touchDist(e);
       if (d < 8) return;
@@ -175,9 +178,10 @@ export class Input {
     const held = (c: string) => this.held(c);
     this.edges.clear();
     const checkEdge = (c: string) => {
-      if (held(c) && !this.prev.has(c)) this.edges.add(c);
+      if ((held(c) && !this.prev.has(c)) || (!this.injected && this.pressed.has(c))) this.edges.add(c);
     };
     for (const c of GAME_CODES) checkEdge(c);
+    this.pressed.clear();
 
     let pitch = 0;
     if (held("KeyA") || held("ArrowLeft")) pitch += 1;
@@ -250,10 +254,10 @@ export class Input {
   }
 
   cameraHotkey(): number | null {
-    if (this.held("Digit1")) return 1;
-    if (this.held("Digit2")) return 2;
-    if (this.held("Digit3")) return 3;
-    if (this.held("Digit4")) return 4;
+    if (this.edges.has("Digit1")) return 1;
+    if (this.edges.has("Digit2")) return 2;
+    if (this.edges.has("Digit3")) return 3;
+    if (this.edges.has("Digit4")) return 4;
     return null;
   }
 
