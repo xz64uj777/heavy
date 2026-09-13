@@ -1,3 +1,6 @@
+import { loadLoadout } from "./loadout";
+import { createPractice, type PracticeId } from "./practice";
+import { ActionBuffer } from "./action-buffer";
 import { LaunchAudio } from "./audio";
 import { DEFAULT_CONFIG, MOON_A, MOON_R, STEP } from "./config";
 import { haptic } from "./haptic";
@@ -25,6 +28,7 @@ export class LaunchGame {
   private ctx: CanvasRenderingContext2D;
   private raf = 0;
   private acc = 0;
+  private pending = new ActionBuffer();
   private last = 0;
   private running = false;
   private hudTimer = 0;
@@ -45,7 +49,7 @@ export class LaunchGame {
     const saved = loadFlight();
     if (saved) {
       this.sim = saved;
-      this.config = { ...saved.config };
+      this.config = saved.practice ? loadLoadout() : { ...saved.config };
       this.restored = true;
     } else {
       this.sim = createSim(this.config);
@@ -53,6 +57,7 @@ export class LaunchGame {
     this.input.attach(this.canvas);
     this.input.onVisibility = (hidden) => {
       if (hidden) {
+        this.pending.clear();
         if (this.sim.phase !== "hangar") {
           if (!this.sim.ended) this.sim.paused = true;
           saveFlight(this.sim);
@@ -105,7 +110,18 @@ export class LaunchGame {
     this.sim.hangarOpen = open;
   }
 
+  practice(id: PracticeId) {
+    this.audio.unlock();
+    this.sim = createPractice(id);
+    this.pending.clear();
+    this.acc = 0;
+    this.onHud(snapshot(this.sim));
+    saveFlight(this.sim);
+  }
+
   launch() {
+    this.pending.clear();
+    this.acc = 0;
     this.audio.unlock();
     this.lastCount = 99;
     if (this.sim.phase !== "hangar") {
@@ -119,6 +135,8 @@ export class LaunchGame {
   }
 
   reset() {
+    this.pending.clear();
+    this.acc = 0;
     clearFlight();
     this.sim = createSim(this.config);
     this.sim.hangarOpen = true;
@@ -127,6 +145,8 @@ export class LaunchGame {
   }
 
   abort() {
+    this.pending.clear();
+    this.acc = 0;
     clearFlight();
     this.sim = abortToHangar(this.sim, this.config);
     this.audio.stopEngines();
@@ -170,7 +190,9 @@ export class LaunchGame {
     this.last = now;
     if (dt > 0.1) dt = 0.1;
 
-    const act = this.input.sample();
+    let act = this.input.sample();
+    this.pending.add(act);
+    act = this.pending.peek(act);
     if (this.input.tabHidden && this.sim.phase !== "hangar" && !this.sim.ended) {
       this.sim.paused = true;
     }
@@ -214,12 +236,14 @@ export class LaunchGame {
               throttleAbs: act.throttleAbs,
             };
       stepSim(this.sim, sliceDt, slice);
+      if (steps === 0) this.pending.clear();
       this.acc -= sliceDt;
       steps++;
     }
     if (scale === 0) {
       this.acc = 0;
       stepSim(this.sim, dt, act);
+      this.pending.clear();
     }
 
     const cssW = this.canvas.clientWidth;
