@@ -62,6 +62,55 @@
   }
 }
 
+/* Landscape phones and unfolded devices need more than the normal p-3 HUD
+   gutter.  The native WebView/browser can report a display cutout or rounded
+   edge through the safe-area env vars; the minimum gutter also protects
+   devices that report zero while in immersive mode. */
+@media (orientation: landscape) {
+  main > .pointer-events-none.absolute.inset-0.z-10 {
+    padding-left: max(1.25rem, env(safe-area-inset-left)) !important;
+    padding-right: max(1.25rem, env(safe-area-inset-right)) !important;
+  }
+
+  /* Lower-left pitch/camera controls used to stay at left-3 and could cover
+     the telemetry chips on short landscape screens. */
+  .pointer-events-auto.absolute.bottom-24.left-3 {
+    left: max(1.25rem, env(safe-area-inset-left)) !important;
+  }
+
+  /* Keep the live throttle/fuel stack clear of the opposite screen edge too. */
+  .pointer-events-auto.absolute.right-3.bottom-24 {
+    right: max(1.25rem, env(safe-area-inset-right)) !important;
+  }
+}
+
+/* Phones are often only ~350-500 CSS px tall in landscape.  Compress the
+   telemetry row instead of letting it grow down into the flight controls. */
+@media (orientation: landscape) and (max-height: 520px) {
+  main > .pointer-events-none.absolute.inset-0.z-10 {
+    padding-top: max(0.5rem, env(safe-area-inset-top)) !important;
+  }
+
+  main > .pointer-events-none.absolute.inset-0.z-10 > .mt-3.flex.max-w-full.flex-wrap.gap-2 {
+    margin-top: 0.4rem !important;
+    gap: 0.3rem !important;
+  }
+
+  main > .pointer-events-none.absolute.inset-0.z-10 > .mt-3.flex.max-w-full.flex-wrap.gap-2 > .rounded-md {
+    padding: 0.25rem 0.45rem !important;
+  }
+
+  main > .pointer-events-none.absolute.inset-0.z-10 > .mt-3.flex.max-w-full.flex-wrap.gap-2 > .rounded-md > div:first-child {
+    font-size: 0.6rem !important;
+    line-height: 0.75rem !important;
+  }
+
+  main > .pointer-events-none.absolute.inset-0.z-10 > .mt-3.flex.max-w-full.flex-wrap.gap-2 > .rounded-md > div:last-child {
+    font-size: 0.75rem !important;
+    line-height: 1rem !important;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
