@@ -1,0 +1,79 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install web dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build standalone web game
+        run: npm run build:web
+
+      - name: Copy web build into Android assets
+        run: |
+          rm -rf android/app/src/main/assets/www
+          mkdir -p android/app/src/main/assets/www
+          cp -R dist-helios/. android/app/src/main/assets/www/
+          test -f android/app/src/main/assets/www/scripts/helios-standalone.html
+
+      - name: Use CI-safe Android signing
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/build.gradle')
+          s = p.read_text()
+          start = s.find('def keystoreFile = file("helios.jks")')
+          if start != -1:
+              s = s.replace('def keystoreFile = file("helios.jks")\n\n', '')
+          signing = '''    signingConfigs {\n        release {\n            storeFile keystoreFile\n            storePassword "heliosheavy"\n            keyAlias "helios"\n            keyPassword "heliosheavy"\n        }\n    }\n\n'''
+          s = s.replace(signing, '')
+          s = s.replace('            signingConfig signingConfigs.release\n', '')
+          s = s.replace('        debug {\n        }\n', '')
+          p.write_text(s)
+          PY
+          cat android/app/build.gradle
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        run: gradle -p android :app:assembleDebug --stacktrace
+
+      - name: Prepare APK
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk Helios-Heavy.apk
+          ls -lh Helios-Heavy.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helios-heavy-apk
+          path: Helios-Heavy.apk
+          if-no-files-found: error
+          retention-days: 30
