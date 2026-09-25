@@ -4,7 +4,7 @@
  * Usage: node scripts/assemble-clear.mjs
  * Writes src/game/render.ts, src/game/sim.ts, src/components/LaunchSim.tsx
  */
-import { readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -25,7 +25,9 @@ function assemble(name, dest) {
   if (want && sha !== want) {
     throw new Error(`${dest} sha256 mismatch: got ${sha}, want ${want}`);
   }
-  writeFileSync(join(root, dest), body);
+  const out = join(root, dest);
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, body);
   console.log("wrote", dest, "bytes", Buffer.byteLength(body), "sha256", sha.slice(0, 16));
 }
 
