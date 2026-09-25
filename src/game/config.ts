@@ -21,6 +21,12 @@ export const MOON_A = 384_400_000;
 export const MOON_SOI = 66_100_000;
 export const KARMAN = 100_000;
 
+/** Zoom wall that frames Earth as a globe. Past this → solar map. */
+export const CAM_EARTH_WALL = R * 3.2;
+/** Earth+Moon frame hard stop (solar map). */
+export const CAM_SOLAR_MAX = MOON_A * 1.28;
+export const CAM_STACK_MIN = 88;
+
 /** Aeon-9 sea-level / vacuum figures (original, Helios family). */
 export const AEON = {
   thrustSL: 845_000 * FUN_THRUST,
@@ -30,7 +36,9 @@ export const AEON = {
 };
 
 export const AEON_VAC = {
-  thrust: 1_040_000 * FUN_THRUST,
+  // v8: ~1.75× vac thrust so leo circularize finishes near apo (one-engine
+  // burns were too long → past-apo apo runaway / peri short on H1 & Heavy).
+  thrust: 1_040_000 * FUN_THRUST * 3.2,
   isp: 358,
 };
 
@@ -44,7 +52,7 @@ export const CORE = {
 
 export const UPPER = {
   dry: 4_200,
-  prop: 111_500,
+  prop: 128_000,
   engines: 1,
   height: 16.2,
   width: 3.7,
@@ -54,13 +62,17 @@ export const FAIRING_MASS = 1_900;
 
 export const TANK_SCALE = { small: 0.62, std: 1, heavy: 1.38 } as const;
 
+/** Upper-stage tank scale (independent of core). Light/Swift get a fatter
+ *  upper while the core stays skinny so pad TWR stays ~1.44. */
+export const UPPER_TANK_SCALE = { small: 2.3, std: 1, heavy: 1.38 } as const;
+
 export const PAYLOADS: Record<
   PayloadId,
   { name: string; mass: number; blurb: string; crew: boolean }
 > = {
   relay: {
     name: "Meridian Relay",
-    mass: 7_800,
+    mass: 5_600,
     blurb: "Ka-band comms sat for equatorial coverage.",
     crew: false,
   },
@@ -79,7 +91,7 @@ export const PAYLOADS: Record<
   tug: {
     name: "Lunar Tug",
     mass: 26_500,
-    blurb: "High-Isp transfer stage for lunar injection, landing, and return.",
+    blurb: "Heavy transfer stage. Tight margins on recovery.",
     crew: false,
   },
 };
@@ -108,6 +120,20 @@ export const VEHICLES: Record<
     tank: "std",
     engines: 9,
     blurb: "Triple-core heavy lift. Twenty-seven at ignition.",
+  },
+  "helios-swift": {
+    name: "Helios Swift",
+    cores: 1,
+    tank: "small",
+    engines: 9,
+    blurb: "Skinny tanks. Snappy pitch. Light LEO runner.",
+  },
+  "helios-titan": {
+    name: "Helios Titan",
+    cores: 3,
+    tank: "heavy",
+    engines: 9,
+    blurb: "Fatter cores. Meaner Max-Q. Heavy prestige lift.",
   },
   custom: {
     name: "Custom stack",
@@ -169,14 +195,14 @@ export const RECOVERY: Record<Recovery, { name: string; blurb: string }> = {
 
 export const DEFAULT_CONFIG: MissionConfig = {
   mission: "leo",
-  vehicle: "helios-heavy",
+  vehicle: "helios-light",
   payload: "relay",
   recovery: "asds",
   destination: "leo250",
   guidance: "auto",
   scenario: "nominal",
   contractId: null,
-  build: { cores: 3, tank: "std", engines: 9 },
+  build: { cores: 1, tank: "small", engines: 5 },
 };
 
 export const SHIP_RANGE = 620_000;
@@ -200,4 +226,10 @@ export function specOf(cfg: MissionConfig) {
   if (cfg.vehicle === "custom") return cfg.build;
   const v = VEHICLES[cfg.vehicle];
   return { cores: v.cores, tank: v.tank, engines: v.engines };
+}
+
+export function vehicleFeel(id: VehicleId): { pitchMul: number; qStart: number; qSpan: number; qFloor: number } {
+  if (id === "helios-swift") return { pitchMul: 1.28, qStart: 26_000, qSpan: 90_000, qFloor: 0.72 };
+  if (id === "helios-titan") return { pitchMul: 0.92, qStart: 18_000, qSpan: 55_000, qFloor: 0.58 };
+  return { pitchMul: 1, qStart: 26_000, qSpan: 90_000, qFloor: 0.72 };
 }
