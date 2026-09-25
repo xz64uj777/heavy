@@ -1,0 +1,31 @@
+name: assemble-clear
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch to checkout and push CLEAR onto
+        required: true
+        default: v10
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Decode CLEAR zip b64 and write targets
+        run: node scripts/decode-clear-zip.mjs
+      - name: Commit assembled CLEAR
+        run: |
+          git config user.name "helios-assemble"
+          git config user.email "helios-assemble@users.noreply.github.com"
+          git add src/game/render.ts src/game/sim.ts src/components/LaunchSim.tsx
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "assemble Helios Heavy v10 CLEAR blobs (render/sim/LaunchSim)"
+          git push origin HEAD:${{ github.event.inputs.target_ref }}
