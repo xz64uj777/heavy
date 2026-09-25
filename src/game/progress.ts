@@ -2,6 +2,7 @@ import { MISSIONS } from "./missions";
 import type { ContractId, Guidance, HudSnapshot, MissionId, ScenarioId } from "./types";
 import { CONTRACTS, SCENARIOS } from "./challenges";
 import type { Difficulty, GameMode } from "./settings";
+import { noteMissionDone } from "./settings";
 
 export type Medal = "none" | "bronze" | "silver" | "gold" | "platinum";
 
@@ -504,7 +505,11 @@ export function recordFlight(
   };
 
   const completed = new Set(profile.completed);
-  if (record.success && mode === "career" && careerObjectiveSatisfied(hud)) completed.add(record.mission);
+  if (record.success && mode === "career" && careerObjectiveSatisfied(hud)) {
+    completed.add(record.mission);
+    // Keep Cape Meridian hangar gates (settings.career.missionsDone) in sync.
+    noteMissionDone(record.mission);
+  }
 
   const contractsCompleted = new Set(profile.contractsCompleted);
   if (score.contractComplete && hud.contractId) contractsCompleted.add(hud.contractId);

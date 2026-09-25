@@ -1,0 +1,75 @@
+        grd.addColorStop(0.18, "rgba(255,190,90,0.85)");
+        grd.addColorStop(0.55, "rgba(230,90,40,0.45)");
+        grd.addColorStop(1, "rgba(180,40,10,0)");
+        ctx.fillStyle = grd;
+        ctx.beginPath();
+        ctx.moveTo(-bodyW * 0.42, y0 + 1.2 * s);
+        ctx.lineTo(bodyW * 0.42, y0 + 1.2 * s);
+        ctx.lineTo(bodyW * 0.08, y0 + 1.2 * s + L);
+        ctx.lineTo(-bodyW * 0.08, y0 + 1.2 * s + L);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      if (withUpper) {
+        const uh = 16.2 * s;
+        const uw = 3.5 * s;
+        const uy = y0 - bodyH - uh;
+        ctx.fillStyle = "#eef0f3";
+        roundRect(ctx, -uw / 2, uy, uw, uh, 0.25 * s);
+        ctx.fill();
+        // Upper stage sun strip.
+        ctx.fillStyle = `rgba(255,255,255,${0.2 * (1 - opt.soot * 0.5)})`;
+        ctx.fillRect(-uw / 2 + uw * 0.15, uy + 0.3 * s, uw * 0.18, uh - 0.6 * s);
+        ctx.fillStyle = "#1a1c20";
+        ctx.fillRect(-uw / 2, y0 - bodyH - 1.5 * s, uw, 1.5 * s);
+        if (opt.fairing) {
+          if (opt.payload === "halo") {
+            this.capsule(ctx, 0, uy, s);
+          } else {
+            const fh = 13 * s;
+            const fw = 5.1 * s;
+            ctx.fillStyle = "#f7f8fa";
+            ctx.beginPath();
+            ctx.moveTo(-fw / 2, uy);
+            ctx.lineTo(fw / 2, uy);
+            ctx.lineTo(fw * 0.28, uy - fh * 0.72);
+            ctx.quadraticCurveTo(0, uy - fh, -fw * 0.28, uy - fh * 0.72);
+            ctx.closePath();
+            ctx.fill();
+            ctx.fillStyle = "rgba(255,255,255,0.28)";
+            ctx.beginPath();
+            ctx.moveTo(-fw * 0.18, uy - 0.2 * s);
+            ctx.lineTo(-fw * 0.05, uy - fh * 0.7);
+            ctx.lineTo(fw * 0.02, uy - fh * 0.55);
+            ctx.lineTo(-fw * 0.08, uy);
+            ctx.closePath();
+            ctx.fill();
+            ctx.strokeStyle = "rgba(20,22,28,0.2)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.restore();
+    };
+
+    if (opt.heavy) {
+      drawCore(-3.85, false, true);
+      drawCore(3.85, false, true);
+      drawCore(0, opt.upper, false);
+    } else if (opt.core) {
+      drawCore(0, opt.upper, !opt.upper);
+    } else if (opt.upper) {
+      drawCore(0, true, false);
+    }
+
+    ctx.restore();
+  }
+
+  private capsule(ctx: CanvasRenderingContext2D, x: number, y: number, s: number) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = "#e8eaef";
+    ctx.beginPath();
+    ctx.moveTo(-2.4 * s, 0);
