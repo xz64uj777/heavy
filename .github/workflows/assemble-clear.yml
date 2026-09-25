@@ -1,0 +1,25 @@
+name: assemble-clear
+on:
+  workflow_dispatch:
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Assemble CLEAR blobs
+        run: node scripts/assemble-clear.mjs
+      - name: Commit assembled CLEAR
+        run: |
+          git config user.name "helios-assemble"
+          git config user.email "helios-assemble@users.noreply.github.com"
+          git add src/game/render.ts src/game/sim.ts src/components/LaunchSim.tsx
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "assemble Helios Heavy v10 CLEAR blobs (render/sim/LaunchSim)"
+          git push origin HEAD:v10
