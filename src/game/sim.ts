@@ -1,6 +1,9 @@
 import {
   AEON,
   AEON_VAC,
+  CAM_EARTH_WALL,
+  CAM_SOLAR_MAX,
+  CAM_STACK_MIN,
   CORE,
   DESTINATIONS,
   FAIRING_MASS,
@@ -17,8 +20,10 @@ import {
   SHIP_RANGE,
   specOf,
   TANK_SCALE,
+  UPPER_TANK_SCALE,
   UPPER,
   GM,
+  vehicleFeel,
 } from "./config";
 import {
   altitude,
@@ -33,16 +38,12 @@ import {
   progradeHeading,
   radialHeading,
   retrogradeHeading,
-  sampleBallistic,
-  sampleBurn,
-  sampleConic,
   soundSpeed,
   suicideDist,
   surfacePoint,
   wrapAngle,
-  type PredictedPath,
 } from "./physics";
-import { PITCH_RATE, THROTTLE_SLEW, getSettings } from "./settings";
+import { PITCH_RATE, QUALITY, THROTTLE_SLEW, getSettings, noteAsdsLanding, noteHeavyRecovery, noteMissionDone } from "./settings";
 import type {
   Actions,
   Flyer,
@@ -53,13 +54,6 @@ import type {
   Sim,
   Stage,
 } from "./types";
-
-const LUNAR_PARK_APO = 220_000;
-const LUNAR_PARK_PERI = 180_000;
-// Put transfer apo just above the Moon's near-side surface so the fixed-Moon
-// encounter model has a generous capture corridor instead of skimming the SOI.
-const TLI_TARGET_APO = MOON_A - R - MOON_R + 500_000;
-const TLI_WINDOW = 0.11;
 
 function makeStage(
   name: string,
@@ -90,10 +84,14 @@ export function createSim(cfg: MissionConfig): Sim {
   const payload = PAYLOADS[cfg.payload];
   const rec = cfg.recovery;
   const tank = TANK_SCALE[spec.tank];
+  const upperTank = UPPER_TANK_SCALE[spec.tank];
   const com = 26;
   const coreProp = CORE.prop * tank;
   const coreDry = CORE.dry * (0.85 + tank * 0.15);
-  const upperProp = UPPER.prop * tank;
+  // Light (5 Aeons, skinny tanks): boost per-engine thrust so MECO energy
+  // approaches H1 without fattening the core tank (pad TWR stays >1.2).
+  const lightCoreMul =
+    spec.tank === "small" && spec.engines <= 5 ? 2.05 : 1;
   const mk = (name: string, attached: boolean, side: boolean): Stage => ({
     name,
     dry: coreDry,
@@ -102,16 +100,23 @@ export function createSim(cfg: MissionConfig): Sim {
     engines: spec.engines,
     ispSL: AEON.ispSL,
     ispVac: AEON.ispVac,
-    thrustSL: AEON.thrustSL,
-    thrustVac: AEON.thrustVac,
+    // Per-engine thrust; stageForce multiplies by engines once.
+    // (engines/9)*engines under-thrust Light (5) and over-thrust Titan (13).
+    thrustSL: AEON.thrustSL * lightCoreMul,
+    thrustVac: AEON.thrustVac * lightCoreMul,
     attached,
     reserve: reserveFor(rec, side),
     throttleLimit: heavy && !side ? 0.82 : 1,
   });
-  const stAng = 1.898; // phased to meet Halo near 400 km insertion
+  const stAng = Math.PI / 2 - 0.28;
   const stR = R + 400_000;
   return {
-    config: { ...cfg, build: { ...cfg.build } },
+    config: {
+      ...cfg,
+      build: { ...cfg.build },
+      scenario: cfg.scenario ?? "nominal",
+      contractId: cfg.contractId ?? null,
+    },
     phase: "hangar",
     ended: null,
     t: -6,
@@ -128,16 +133,16 @@ export function createSim(cfg: MissionConfig): Sim {
     core: mk("Core", true, false),
     upper: {
       name: "Upper",
-      dry: UPPER.dry * tank,
-      prop: upperProp,
-      propMax: upperProp,
-      // Heavy lunar payloads use a dual-engine launch upper stage; the
-      // dedicated high-Isp Tug takes over only after parking orbit.
-      engines: cfg.payload === "tug" ? 2 : UPPER.engines,
+      dry: UPPER.dry, // keep dry fixed — scale adds prop only
+      prop: UPPER.prop * upperTank,
+      propMax: UPPER.prop * upperTank,
+      engines: UPPER.engines,
       ispSL: AEON_VAC.isp,
       ispVac: AEON_VAC.isp,
-      thrustSL: AEON_VAC.thrust,
-      thrustVac: AEON_VAC.thrust,
+      // Light/Swift: hotter vac upper cuts gravity loss on the long second-
+      // stage burn (skinny core MECO ~1.4 km/s). H1/Heavy unchanged.
+      thrustSL: AEON_VAC.thrust * (spec.tank === "small" ? 1.5 : 1),
+      thrustVac: AEON_VAC.thrust * (spec.tank === "small" ? 1.5 : 1),
       attached: true,
       reserve: 0.01,
       throttleLimit: 1,
@@ -168,7 +173,6 @@ export function createSim(cfg: MissionConfig): Sim {
       zoomVis: 310,
       offsetX: 0,
       offsetY: 0,
-      savedZoom: { stack: 310 },
     },
     follow: "stack",
     shake: 0,
@@ -185,8 +189,8 @@ export function createSim(cfg: MissionConfig): Sim {
     peakSpeed: 0,
     landings: 0,
     landingGoal: landingGoal(cfg),
-    targetApo: cfg.mission === "lunar" || cfg.mission === "home" || cfg.mission === "gto" ? LUNAR_PARK_APO : dest.apo,
-    targetPeri: cfg.mission === "lunar" || cfg.mission === "home" || cfg.mission === "gto" ? LUNAR_PARK_PERI : dest.peri,
+    targetApo: dest.apo,
+    targetPeri: dest.peri,
     gto: dest.gto,
     rng: 1,
     hangarOpen: true,
@@ -199,12 +203,6 @@ export function createSim(cfg: MissionConfig): Sim {
     atmo: "pad",
     body: "earth",
     moonLanded: false,
-    moonTouchdownAt: 0,
-    tugActivated: false,
-    tliBurning: false,
-    lunarApproachDone: false,
-    gtoComplete: false,
-    homebound: false,
     docked: false,
     stationX: Math.cos(stAng) * stR,
     stationY: Math.sin(stAng) * stR,
@@ -223,11 +221,78 @@ function event(sim: Sim, label: string) {
   sim.eventFlash = 1;
 }
 
+function liveProp(sim: Sim): number {
+  if (sim.boosterL.attached || sim.boosterR.attached) {
+    const l = sim.boosterL.attached ? sim.boosterL.prop : Infinity;
+    const r = sim.boosterR.attached ? sim.boosterR.prop : Infinity;
+    return Math.min(l, r);
+  }
+  if (sim.core.attached) return sim.core.prop;
+  return sim.upper.prop;
+}
+
+function failOutOfProp(sim: Sim, detail: string) {
+  if (sim.ended) return;
+  sim.throttle = 0;
+  sim.enginesLit = false;
+  sim.paused = true;
+  sim.timeScale = 1;
+  sim.phase = "ended";
+  sim.ended = {
+    success: false,
+    title: "Out of propellant",
+    detail,
+    orbit: false,
+    landings: sim.landings,
+    landingGoal: sim.landingGoal,
+  };
+  event(sim, "OUT OF PROP");
+}
+
+function starveIfDry(sim: Sim, neededBurn: boolean, detail: string): boolean {
+  if (liveProp(sim) > 1) return false;
+  sim.throttle = 0;
+  sim.enginesLit = false;
+  if (neededBurn && !sim.ended && !sim.moonLanded) {
+    failOutOfProp(sim, detail);
+  }
+  return true;
+}
+
+function maxWarpFor(sim: Sim): number {
+  const alt = altitude(sim.x, sim.y);
+  const boostersOn = sim.boosterL.attached || sim.boosterR.attached;
+  // Refuse warp ≥2 while side boosters are still attached in atmosphere,
+  // or while the first stage is still flying in dense air.
+  if (boostersOn && alt < 100_000) return 1;
+  if (sim.core.attached && alt < 70_000) return 1;
+  if (sim.phase === "lunar") return 2;
+  if (sim.phase === "tli" || sim.body === "moon") return 4;
+  return 8;
+}
+
+function sanitizeSim(sim: Sim): boolean {
+  if (
+    !Number.isFinite(sim.x) ||
+    !Number.isFinite(sim.y) ||
+    !Number.isFinite(sim.vx) ||
+    !Number.isFinite(sim.vy)
+  ) {
+    explodeStack(sim, "Guidance diverged.");
+    sim.paused = true;
+    return false;
+  }
+  if (!Number.isFinite(sim.heading) || !Number.isFinite(sim.omega)) {
+    sim.heading = radialHeading(sim.x, sim.y);
+    sim.omega = 0;
+  }
+  if (!Number.isFinite(sim.throttle)) sim.throttle = 0;
+  if (!Number.isFinite(sim.timeScale) || sim.timeScale < 1) sim.timeScale = 1;
+  return true;
+}
+
 function stackMass(sim: Sim): number {
-  // Detached stages are separate flyers and must not remain dead weight on the
-  // active stack. This matters enormously for upper-stage and lunar delta-v.
-  let m = sim.upper.dry + sim.upper.prop;
-  if (sim.core.attached) m += sim.core.dry + sim.core.prop;
+  let m = sim.core.dry + sim.core.prop + sim.upper.dry + sim.upper.prop;
   m += sim.payloadMass;
   if (!sim.fairingJettisoned) m += sim.fairingMass;
   if (sim.boosterL.attached) m += sim.boosterL.dry + sim.boosterL.prop;
@@ -489,6 +554,8 @@ function deployPayload(sim: Sim) {
 function explodeStack(sim: Sim, reason: string) {
   if (sim.ended) return;
   sim.phase = "ended";
+  sim.paused = true;
+  sim.timeScale = 1;
   sim.ended = {
     success: false,
     title: "Vehicle lost",
@@ -554,7 +621,8 @@ function success(sim: Sim, title: string, detail: string) {
     landings: sim.landings,
     landingGoal: sim.landingGoal,
   };
-  event(sim, title.toUpperCase());
+  noteMissionDone(sim.config.mission);
+  event(sim, "ORBIT CONFIRMED");
 }
 
 export function beginLaunch(sim: Sim) {
@@ -572,82 +640,36 @@ export function abortToHangar(sim: Sim, cfg: MissionConfig): Sim {
   return createSim(cfg);
 }
 
-function camDefaultVis(follow: FollowId): number {
-  if (follow === "earth") return R * 2.45;
-  if (follow === "stack") return 420;
-  return 560;
-}
-
-function lookTarget(sim: Sim): { x: number; y: number } {
-  const flyer = (role: Flyer["role"]) => {
-    const f = sim.flyers.find((b) => b.role === role && (b.alive || b.landed));
-    return f ? { x: f.x, y: f.y } : { x: sim.x, y: sim.y };
-  };
-  if (sim.follow === "boosterL") return flyer("boosterL");
-  if (sim.follow === "boosterR") return flyer("boosterR");
-  if (sim.follow === "core") return flyer("core");
-  return { x: sim.x, y: sim.y };
-}
-
-function snapCamera(sim: Sim) {
-  const t = lookTarget(sim);
-  sim.cam.x = t.x;
-  sim.cam.y = t.y;
-  sim.cam.vis = sim.cam.zoomVis;
-  sim.cam.zoomMul = sim.cam.zoomVis / 310;
-}
-
-function applyFollow(sim: Sim, follow: FollowId) {
-  sim.cam.savedZoom[sim.follow] = sim.cam.zoomVis;
-  sim.follow = follow;
-  const saved = sim.cam.savedZoom[follow];
-  sim.cam.zoomVis = saved && saved > 40 ? saved : camDefaultVis(follow);
-  snapCamera(sim);
-}
-
 function nextCamera(sim: Sim) {
-  const order: FollowId[] = ["stack"];
-  if (sim.flyers.some((f) => f.role === "boosterL" && (f.alive || f.landed))) order.push("boosterL");
-  if (sim.flyers.some((f) => f.role === "boosterR" && (f.alive || f.landed))) order.push("boosterR");
-  if (sim.flyers.some((f) => f.role === "core" && (f.alive || f.landed))) order.push("core");
-  order.push("earth");
+  // Pad → Chase → Stack → Booster → Core → Earth → Solar
+  const order: FollowId[] = ["pad", "chase", "stack"];
+  const boosterAlive =
+    sim.flyers.find((f) => f.role === "boosterL" && f.alive) ??
+    sim.flyers.find((f) => f.role === "boosterR" && f.alive);
+  if (boosterAlive) order.push(boosterAlive.role === "boosterR" ? "boosterR" : "boosterL");
+  if (sim.flyers.some((f) => f.role === "core" && f.alive)) order.push("core");
+  order.push("earth", "solar");
   const i = order.indexOf(sim.follow);
-  applyFollow(sim, order[(i + 1) % order.length] ?? "stack");
+  sim.follow = order[(i + 1) % order.length] ?? "pad";
 }
 
 function setCameraSlot(sim: Sim, n: number) {
-  if (n === 1) applyFollow(sim, "stack");
-  else if (n === 2) applyFollow(sim, "earth");
-  else if (n === 3) {
-    applyFollow(
-      sim,
-      sim.flyers.some((f) => f.role === "boosterL") ? "boosterL" : "stack",
-    );
-  } else if (n === 4) {
-    applyFollow(
-      sim,
-      sim.flyers.some((f) => f.role === "core") ? "core" : "earth",
-    );
+  if (n === 1) sim.follow = "pad";
+  else if (n === 2) sim.follow = "chase";
+  else if (n === 3) sim.follow = "stack";
+  else if (n === 4) {
+    const booster =
+      sim.flyers.find((f) => f.role === "boosterL" && f.alive) ??
+      sim.flyers.find((f) => f.role === "boosterR" && f.alive);
+    if (booster) sim.follow = booster.role === "boosterR" ? "boosterR" : "boosterL";
+    else if (sim.flyers.some((f) => f.role === "core" && f.alive)) sim.follow = "core";
+    else sim.follow = "earth";
   }
-}
-
-function warpLimit(sim: Sim): number {
-  const lunarMission = sim.config.mission === "lunar" || sim.config.mission === "home";
-  const moonD = Math.hypot(sim.x - MOON_A, sim.y);
-  const earthAlt = altitude(sim.x, sim.y);
-  if ((sim.phase === "tli" || sim.phase === "return") && moonD > MOON_SOI && earthAlt > 1_500_000) {
-    return 4096;
-  }
-  if (lunarMission && sim.phase === "orbit" && !sim.tliBurning) return 128;
-  if (sim.phase === "lunar" && moonD > MOON_R + 5_000_000) return 2048;
-  if (sim.phase === "lunar" && moonD > MOON_R + 2_000_000) return 128;
-  if (sim.phase === "lunar" && moonD > MOON_R + 800_000) return 32;
-  return 8;
 }
 
 function warpCycle(sim: Sim) {
-  const all = [1, 2, 4, 8, 32, 128, 512, 2048, 4096];
-  const seq = all.filter((v) => v <= warpLimit(sim));
+  const cap = maxWarpFor(sim);
+  const seq = [1, 2, 4, 8].filter((n) => n <= cap);
   const i = seq.indexOf(sim.timeScale);
   sim.timeScale = seq[(i + 1) % seq.length] ?? 1;
 }
@@ -655,34 +677,6 @@ function warpCycle(sim: Sim) {
 function smooth01(u: number) {
   const t = clamp(u, 0, 1);
   return t * t * (3 - 2 * t);
-}
-
-function fmtKm(m: number) {
-  return `${Math.max(0, m / 1000).toFixed(m < 100_000 ? 1 : 0)} km`;
-}
-
-function activateTug(sim: Sim) {
-  if (sim.tugActivated || sim.payloadKind !== "tug") return;
-  // Parking-orbit handoff: the spent launch upper is discarded and the payload
-  // Lunar Tug becomes the active propulsion stage. This keeps launch ascent and
-  // deep-space performance separately tuneable instead of carrying an absurdly
-  // oversized upper stage from the pad.
-  const home = sim.config.mission === "home";
-  sim.tugActivated = true;
-  sim.upper.name = "Lunar Tug";
-  sim.upper.dry = home ? 8_000 : 10_000;
-  sim.upper.prop = home ? 175_000 : 80_000;
-  sim.upper.propMax = sim.upper.prop;
-  sim.upper.engines = home ? 3 : 2;
-  sim.upper.ispSL = home ? 1_325 : 785;
-  sim.upper.ispVac = home ? 1_325 : 785;
-  sim.upper.thrustSL = AEON_VAC.thrust * 0.82;
-  sim.upper.thrustVac = AEON_VAC.thrust * 0.82;
-  sim.payloadMass = home ? 8_000 : 12_000;
-  sim.enginesLit = true;
-  sim.throttle = 0;
-  sim.deployTimer = 0;
-  event(sim, "LUNAR TUG ONLINE");
 }
 
 function guidance(sim: Sim, dt: number, manualPitch: number, manThrot: boolean) {
@@ -710,68 +704,83 @@ function guidance(sim: Sim, dt: number, manualPitch: number, manThrot: boolean) 
     const r = Math.hypot(sim.x, sim.y);
     const vr = (sim.x * sim.vx + sim.y * sim.vy) / r;
     // Gravity-turn pitch program: smoothstep kicks, fewer robotic corners.
+    const lightish =
+      sim.config.vehicle === "helios-light" || sim.config.vehicle === "helios-swift";
     let kick = 0;
     if (alt < 180) kick = 0;
     else if (alt < 12_000) kick = 0.4 * smooth01((alt - 180) / 11_820);
     else if (alt < 42_000) kick = 0.4 + 0.38 * smooth01((alt - 12_000) / 30_000);
     else if (alt < 95_000) kick = 0.78 + 0.17 * smooth01((alt - 42_000) / 53_000);
     else kick = 0.96;
+    // Light: slightly earlier east lean in the mid boost so MECO apo climbs.
+    if (lightish && sim.core.attached && alt > 10_000) {
+      kick = Math.min(0.98, kick + 0.08);
+    }
     desired = lerpAngle(radial, east, kick);
     const progFromUp = Math.abs(wrapAngle(prog - radial));
-    if (sim.core.attached) {
-      if (speed > 420 && progFromUp < 1.4) {
-        desired = lerpAngle(desired, prog, clamp((speed - 420) / 2800, 0, 0.55));
-      }
-    } else {
-      // The vacuum upper begins near 1 g, so an airline-flat pitch program makes
-      // it fall through its own apoapsis before it has orbital speed. Hold a
-      // healthy vertical component until the commanded apo is genuinely built.
-      const apoFrac = clamp(Math.max(0, apo) / Math.max(1, sim.targetApo), 0, 1.4);
-      let upperKick = 0.42 + 0.38 * smooth01(apoFrac);
-      if (sim.payloadKind === "tug" && !sim.tugActivated) {
-        // Keep the heavier lunar launch stack climbing until it has real
-        // horizontal velocity; dual vacuum engines provide the extra authority.
-        if (speed < 5_300) upperKick = Math.min(upperKick, 0.58);
-        else if (speed < 6_300) upperKick = Math.min(upperKick, 0.74);
-        if (apoFrac > 0.92 && vr > 80 && speed > 6_300) upperKick = 0.92;
-      } else if (apoFrac > 0.92 && vr > 80) {
-        upperKick = 0.94;
-      }
-      if (vr < 80) upperKick = Math.min(upperKick, vr < -40 ? 0.32 : 0.48);
-      desired = lerpAngle(radial, east, upperKick);
+    if (speed > 420 && progFromUp < 1.4) {
+      desired = lerpAngle(desired, prog, clamp((speed - 420) / 2400, 0, 0.78));
     }
-    if (vr < -60 && alt < 90_000) {
-      desired = lerpAngle(desired, radial, 0.58);
+    if (vr < -60 && alt < 55_000) {
+      desired = lerpAngle(desired, radial, 0.48);
+    }
+    if (lightish && !sim.core.attached) {
+      if (apo > 170_000 && speed > 5200) {
+        desired = prog;
+      } else {
+        desired = lerpAngle(desired, east, 0.18);
+        if (speed > 900 && progFromUp < 1.5) {
+          desired = lerpAngle(desired, prog, clamp((speed - 900) / 2500, 0.2, 0.8));
+        }
+      }
     }
     throttle = 1;
-    if (sim.q > 26_000) {
-      throttle = clamp(1 - (sim.q - 26_000) / 90_000, 0.72, 1);
+    {
+      const feel = vehicleFeel(sim.config.vehicle);
+      if (sim.q > feel.qStart) {
+        throttle = clamp(1 - (sim.q - feel.qStart) / feel.qSpan, feel.qFloor, 1);
+      }
     }
-    const parkingInserted =
-      peri > sim.targetPeri * 0.94 &&
-      apo > sim.targetApo * 0.78 &&
-      alt > 130_000;
-    if (parkingInserted) {
+    // LEO peri gate: career Orbit insert clears at peri > 160 km.
+    const periGate = Math.max(165_000, Math.min(sim.targetPeri * 0.9, apo - 1_000));
+    // SECO-1: Light keeps ~40–55% upper for circ once apo ≥180 km.
+    // H1/Heavy keep ~95% of target apo.
+    const secoApoGate = lightish
+      ? Math.max(150_000, sim.targetApo * 0.58)
+      : Math.max(200_000, sim.targetApo * 0.95);
+    const upperFrac = sim.upper.propMax > 0 ? sim.upper.prop / sim.upper.propMax : 0;
+    // Light: SECO at ~60% upper once apo ≥150 km — need ~55%+ into circ
+    // to clear peri 160 (H1 does it with ~51% at apo~276).
+    const lightSeco =
+      lightish &&
+      alt > 100_000 &&
+      apo > secoApoGate &&
+      upperFrac <= 0.55;
+    const heavySeco =
+      !lightish && apo > secoApoGate && alt > 140_000;
+    if (
+      !sim.gto &&
+      !sim.core.attached &&
+      peri < periGate &&
+      (lightSeco || heavySeco)
+    ) {
+      throttle = 0;
+      sim.phase = "coast";
+      sim.coastWarpArmed = true;
+      event(sim, "SECO-1 · COAST TO APO");
+    }
+    const inserted = sim.gto
+      ? apo > 30_000_000 && peri > 160_000
+      : peri > periGate && alt > 140_000 && speed > 7000;
+    if (inserted) {
       throttle = 0;
       if (sim.core.attached) {
         sepCore(sim);
       } else {
         sim.phase = "orbit";
-        event(sim, "SECO-2 · PARKING ORBIT");
+        event(sim, sim.gto ? "SECO · GTO" : "SECO-2");
         sim.coastWarpArmed = false;
       }
-    } else if (
-      !sim.core.attached &&
-      apo > sim.targetApo * 0.97 &&
-      peri < sim.targetPeri * 0.9 &&
-      vr > 35 &&
-      ((sim.payloadKind !== "tug" && sim.config.mission !== "gto") || speed > 6_300)
-    ) {
-      throttle = 0;
-      sim.phase = "coast";
-      sim.coastWarpArmed = true;
-      event(sim, "MECO-2 · COAST");
-      sim.objective = "Coast to apoapsis";
     }
     maxRate = alt < 6_000 ? 0.17 : alt < 28_000 ? 0.4 : 0.58;
   } else if (sim.phase === "coast") {
@@ -779,13 +788,18 @@ function guidance(sim: Sim, dt: number, manualPitch: number, manThrot: boolean) 
     throttle = 0;
     const r = Math.hypot(sim.x, sim.y);
     const vr = (sim.x * sim.vx + sim.y * sim.vy) / r;
+    // Apo radius is a(1+e). v7 wrongly used a(1-e) (peri) → nearApo true at SECO
+    // → instant circularize far from apo (Heavy apo runaway / H1 peri short).
+    const ra = el.a * (1 + el.e);
     const nearApo =
       !el.hyperbolic &&
-      Number.isFinite(apo) &&
-      apo > 0 &&
-      alt > apo * 0.965 &&
-      Math.abs(vr) < 110;
-    if (nearApo) {
+      Number.isFinite(ra) &&
+      ra > 0 &&
+      r > ra * 0.97 &&
+      vr < 80;
+    // Prefer true apo approach: low radial speed near apo altitude.
+    const atApo = !el.hyperbolic && alt > 160_000 && vr < 40 && alt >= el.apoAlt * 0.96;
+    if (atApo || nearApo) {
       sim.phase = "circularize";
       sim.circStarted = true;
       sim.timeScale = 1;
@@ -793,291 +807,94 @@ function guidance(sim: Sim, dt: number, manualPitch: number, manThrot: boolean) 
     }
   } else if (sim.phase === "circularize") {
     desired = prog;
-    const periErr = sim.targetPeri - peri;
-    throttle = peri > 0 ? clamp(periErr / 110_000, 0.12, 1) : 1;
-    if (apo > sim.targetApo * 1.35) throttle *= 0.55;
-    maxRate = 0.6;
-    if (peri > sim.targetPeri * 0.97 && apo > sim.targetApo * 0.75) {
+    maxRate = 0.7;
+    // Orbit insert career gate is peri > 160 km — burn until that clears (do not
+    // demand targetPeri*0.94 / 235 km). Keep thrusting even past apo once peri is
+    // climbing through the atmosphere band; coasting at peri≈140 softlocked Heavy/H1.
+    // Light/Swift: if apo has already run away (>320 km), only burn near apo so
+    // Δv raises peri instead of pumping apo to thousands of km.
+    const lightishCirc =
+      sim.config.vehicle === "helios-light" || sim.config.vehicle === "helios-swift";
+    const rCirc = Math.hypot(sim.x, sim.y);
+    const vrCirc =
+      rCirc > 1 ? (sim.x * sim.vx + sim.y * sim.vy) / rCirc : 0;
+    // Complete circ at peri ≥160 km (career gate). Light: while peri is still
+    // negative burn continuous; once peri >0 burn only near apo so Δv raises
+    // peri instead of pumping apo to thousands of km.
+    if (peri >= 160_000 && apo > 155_000) {
       throttle = 0;
       sim.phase = "orbit";
       event(sim, "SECO-2");
-    }
-    if (apo > sim.targetApo * 1.7 && peri > 165_000) {
-      throttle = 0;
-      sim.phase = "orbit";
-      event(sim, "SECO-2");
+    } else {
+      const nearApoCirc =
+        Math.abs(vrCirc) < 100 && alt >= Math.max(140_000, apo * 0.92);
+      if (lightishCirc) {
+        throttle = peri < 0 || nearApoCirc ? 1 : 0;
+      } else {
+        throttle = 1;
+      }
+      if (starveIfDry(sim, throttle > 0.05, "Upper stage dry before circularization.")) {
+        throttle = 0;
+      }
     }
   } else if (sim.phase === "orbit") {
     desired = prog;
     throttle = 0;
     const m = sim.config.mission;
-    if (m === "gto") {
-      const gtoTarget = DESTINATIONS.gto.apo;
-      if (!sim.gtoComplete) {
-        desired = prog;
-        throttle = 1;
-        maxRate = 0.55;
-        sim.objective = `GTO injection · apo ${Math.max(0, apo / 1_000_000).toFixed(1)} Mm`;
-        if (apo >= gtoTarget * 0.97 && peri > 150_000) {
-          throttle = 0;
-          sim.gtoComplete = true;
-          sim.deployTimer = 0;
-          event(sim, "SECO · GTO");
-          sim.objective = "Geostationary transfer achieved";
-        }
-      }
-    } else if (m === "lunar" || m === "home") {
-      activateTug(sim);
-      const ang = Math.atan2(sim.y, sim.x);
-      const phaseErr = Math.abs(wrapAngle(ang - Math.PI));
-      const parkingStable = peri > 145_000 && apo > 170_000;
-
-      if (!sim.tliBurning) {
-        sim.objective = parkingStable
-          ? `Phase for TLI · ${(phaseErr * 180 / Math.PI).toFixed(0)}°`
-          : "Stabilize Earth parking orbit";
-        if (parkingStable && phaseErr < TLI_WINDOW) {
-          sim.tliBurning = true;
-          sim.timeScale = 1;
-          event(sim, "TLI BURN");
-        } else if (sim.auto) {
-          if (phaseErr > 0.35 && sim.timeScale < 32) sim.timeScale = 32;
-          else if (phaseErr < 0.24 && sim.timeScale > 8) sim.timeScale = 8;
-          else if (phaseErr < 0.16 && sim.timeScale > 2) sim.timeScale = 2;
-        }
-      }
-
-      if (sim.tliBurning) {
+    // Career Orbit insert: if peri is still under the gate, keep burning prograde.
+    if (
+      m === "leo" &&
+      peri < 165_000 &&
+      !el.hyperbolic &&
+      alt > 140_000 &&
+      sim.upper.attached &&
+      sim.upper.prop > 1
+    ) {
+      desired = prog;
+      throttle = 1;
+      maxRate = 0.55;
+      if (starveIfDry(sim, true, "Upper stage dry raising peri.")) throttle = 0;
+    }
+    if ((m === "lunar" || m === "home") && el.apoAlt > 0) {
+      if (el.apoAlt < 320_000_000) {
         desired = prog;
         throttle = 1;
         maxRate = 0.5;
-        sim.objective = `Trans-lunar burn · apo ${Math.max(0, apo / 1_000_000).toFixed(0)} Mm`;
-        if (apo >= TLI_TARGET_APO || el.hyperbolic) {
+        sim.objective = "Trans-lunar burn";
+        if (starveIfDry(sim, true, "Dry during the trans-lunar burn.")) {
           throttle = 0;
-          sim.phase = "tli";
-          sim.timeScale = 2048;
-          event(sim, "TLI");
-          sim.objective = "Coast to the Moon";
         }
+      } else {
+        throttle = 0;
+        sim.phase = "tli";
+        event(sim, "TLI");
+        sim.objective = "Coast to the Moon";
       }
     }
   } else if (sim.phase === "tli") {
     desired = prog;
     throttle = 0;
-    const moonD = Math.hypot(sim.x - MOON_A, sim.y);
-    sim.objective = `Coast to Moon · ${Math.max(0, (moonD - MOON_R) / 1_000_000).toFixed(1)} Mm`;
-    // Keep high warp through the long, engine-off approach. Physics uses a
-    // coarse deep-space slice here and lunar guidance will step warp down near
-    // the actual braking gate, so slowing tens of millions of meters early only
-    // turned a valid mission into a long real-time wait.
-    if (moonD < MOON_SOI * 1.002 && sim.timeScale > 128) sim.timeScale = 128;
   } else if (sim.phase === "lunar") {
-    const dx = sim.x - MOON_A;
-    const dy = sim.y;
+    const mx = MOON_A;
+    const my = 0;
+    const dx = sim.x - mx;
+    const dy = sim.y - my;
     const d = Math.hypot(dx, dy) || 1;
-    const ux = dx / d;
-    const uy = dy / d;
-    const tx = -uy;
-    const ty = ux;
-    const vr = sim.vx * ux + sim.vy * uy;
-    const vt = sim.vx * tx + sim.vy * ty;
+    const vr = (dx * sim.vx + dy * sim.vy) / d;
+    desired = Math.atan2(-dy, -dx);
     const altM = d - MOON_R;
-    const m = sim.config.mission;
-
+    const need = Math.max(0, -vr);
+    throttle = altM < 80_000 || need > 80 ? 1 : altM < 180_000 ? 0.4 : 0;
+    maxRate = 0.7;
+    sim.objective = "Lunar landing burn";
     if (sim.moonLanded) {
-      desired = Math.atan2(uy, ux);
       throttle = 0;
-      if (m === "home" && sim.auto && sim.t >= sim.moonTouchdownAt + 3) {
-        const earthR = Math.hypot(sim.x, sim.y) || 1;
-        const earthUx = sim.x / earthR;
-        const earthUy = sim.y / earthR;
-        const earthVr = sim.vx * earthUx + sim.vy * earthUy;
-        const earthDx = -earthUx;
-        const earthDy = -earthUy;
-        const earthAboveHorizon = earthDx * ux + earthDy * uy;
-        // First clear the terrain, then command a *velocity* toward Earth. A
-        // simple point-at-Earth burn left several km/s of sideways velocity and
-        // produced a dramatic near miss instead of a return trajectory.
-        let teiError = Infinity;
-        if (altM > 60_000 || earthAboveHorizon > 0.16) {
-          const targetEarthSpeed = 3_300;
-          const tvx = earthDx * targetEarthSpeed;
-          const tvy = earthDy * targetEarthSpeed;
-          const evx = tvx - sim.vx;
-          const evy = tvy - sim.vy;
-          teiError = Math.hypot(evx, evy);
-          desired = Math.atan2(evy, evx);
-          throttle = clamp(teiError / 750, 0.22, 1);
-        } else {
-          desired = Math.atan2(uy, ux);
-          throttle = 1;
-        }
-        maxRate = 1.05;
-        sim.objective = sim.clamps ? "Lunar ascent ignition" : "Trans-Earth injection";
-        if (!sim.clamps && altM > 120_000 && teiError < 55 && earthVr < -2_900) {
-          throttle = 0;
-          sim.phase = "return";
-          sim.homebound = true;
-          sim.timeScale = 512;
-          event(sim, "TEI · HOMEBOUND");
-        }
-      }
-    } else {
-      // Coast ballistically for most of the approach, then perform a late
-      // powered descent. The old controller tried to hold a descent rate tens
-      // of thousands of kilometres out, effectively hovering against lunar
-      // gravity for hours and wasting the entire Tug propellant load.
-      const mass = stackMass(sim);
-      const maxThrust = sim.upper.thrustVac * sim.upper.engines;
-      const tAcc = maxThrust / Math.max(1, mass);
-      const gMoon = MOON_GM / (d * d);
-      const closing = Math.max(0, -vr);
-      const speedToKill = Math.hypot(closing, vt);
-      const netBrake = Math.max(0.35, tAcc - gMoon);
-      const stopDist = (speedToKill * speedToKill) / (2 * netBrake);
-      const ignitionAlt = Math.max(135_000, stopDist * 1.55 + 95_000);
-      const shouldBrake = altM <= ignitionAlt || vr > 80;
-      // TLI is intentionally tolerant so players do not need a pixel-perfect
-      // departure burn. Once inside lunar SOI, autopilot trims the incoming
-      // trajectory into a low-angular-momentum descent corridor. Without this
-      // correction, tiny transfer errors can turn into a days-long high lunar
-      // flyby when high warp is used.
-      const approachErrorVr = -260 - vr;
-      const approachErrorVt = -vt;
-      const approachDvError = Math.hypot(approachErrorVr, approachErrorVt);
-      if (sim.auto && !sim.lunarApproachDone && altM > 8_000_000 && approachDvError < 24) {
-        sim.lunarApproachDone = true;
-        event(sim, "LUNAR CORRIDOR SET");
-      }
-      const needsApproachCorrection =
-        sim.auto && !sim.lunarApproachDone && altM > 8_000_000;
-
-      if (needsApproachCorrection) {
-        if (sim.timeScale > 1) sim.timeScale = 1;
-        const ax = ux * approachErrorVr + tx * approachErrorVt;
-        const ay = uy * approachErrorVr + ty * approachErrorVt;
-        desired = Math.atan2(ay, ax);
-        throttle = approachDvError < 45 ? clamp(approachDvError / 260, 0.035, 0.28) : clamp(approachDvError / 220, 0.12, 1);
-        maxRate = 1.05;
-        sim.objective = `Lunar approach correction · Δv ${approachDvError.toFixed(0)} m/s`;
-      } else if (!shouldBrake) {
-        // Point retrograde now so ignition does not waste seconds slewing, but
-        // keep the engines completely off until the calculated braking gate.
-        desired = retrogradeHeading(sim.vx, sim.vy);
-        throttle = 0;
-        const burnIn = Math.max(0, altM - ignitionAlt);
-        sim.objective = `Lunar coast · ${fmtKm(altM)} · burn in ${fmtKm(burnIn)}`;
-        if (sim.auto && altM > 5_000_000 && sim.timeScale < 2048) sim.timeScale = 2048;
-        else if (sim.auto && altM > 2_000_000 && sim.timeScale < 128) sim.timeScale = 128;
-        if (altM < 2_000_000 && sim.timeScale > 32) sim.timeScale = 32;
-      } else {
-        const targetVr =
-          altM > 120_000 ? -180 :
-          altM > 45_000 ? -120 :
-          altM > 12_000 ? -55 :
-          altM > 2_000 ? -20 :
-          altM > 250 ? -6 :
-          -1.8;
-        // Once the descent controller is settled, let autopilot accelerate the
-        // long, uneventful altitude bands. Drop back to real time whenever the
-        // velocity error grows, and for the final 2 km, so touchdown remains
-        // readable and numerically stable.
-        const descentSettled = Math.abs(vr - targetVr) < 18 && Math.abs(vt) < 18;
-        const descentWarp = altM > 12_000 ? 8 : altM > 2_000 ? 4 : altM > 250 ? 2 : 1;
-        sim.timeScale = sim.auto && descentSettled ? descentWarp : 1;
-        const kRad = altM > 45_000 ? 0.14 : altM > 8_000 ? 0.2 : 0.32;
-        const kTan = altM > 45_000 ? 0.12 : altM > 8_000 ? 0.2 : 0.34;
-        const aRad = gMoon + (targetVr - vr) * kRad;
-        const aTan = -vt * kTan;
-        const ax = ux * aRad + tx * aTan;
-        const ay = uy * aRad + ty * aTan;
-        desired = Math.atan2(ay, ax);
-        throttle = clamp(Math.hypot(ax, ay) / Math.max(0.1, tAcc), 0, 1);
-        maxRate = 1.05;
-        sim.objective = `Powered lunar descent · ${Math.max(0, altM / 1000).toFixed(1)} km · ${Math.hypot(vr, vt).toFixed(0)} m/s`;
-      }
-    }
-  } else if (sim.phase === "return") {
-    const r = Math.hypot(sim.x, sim.y) || 1;
-    const ux = sim.x / r;
-    const uy = sim.y / r;
-    const tx = -uy;
-    const ty = ux;
-    const vr = sim.vx * ux + sim.vy * uy;
-    const vt = sim.vx * tx + sim.vy * ty;
-    const earthAlt = r - R;
-    const speedNow = Math.hypot(sim.vx, sim.vy);
-    desired = prog;
-    throttle = 0;
-
-    if (earthAlt > 2_000_000) {
-      // Small mid-course corrections remove Moon-induced sideways velocity.
-      // Without this the trans-Earth burn can be nominal at cutoff yet miss
-      // Earth by tens of thousands of kilometres after several days of coast.
-      const mass = stackMass(sim);
-      const tAcc = (sim.upper.thrustVac * sim.upper.engines) / Math.max(1, mass);
-      const aTan = -vt * 0.035;
-      const inwardNeed = vr > -1_250 ? (-1_800 - vr) * 0.025 : 0;
-      const aRad = Math.min(0, inwardNeed);
-      const ax = ux * aRad + tx * aTan;
-      const ay = uy * aRad + ty * aTan;
-      const correction = Math.hypot(ax, ay);
-      if (Math.abs(vt) > 32 || vr > -1_250) {
-        desired = Math.atan2(ay, ax);
-        throttle = clamp(correction / Math.max(0.1, tAcc), 0.02, 0.5);
-        if (sim.timeScale > 1) sim.timeScale = 1;
-        sim.objective = `Midcourse correction · Earth ${Math.max(0, earthAlt / 1_000_000).toFixed(0)} Mm`;
-      } else {
-        throttle = 0;
-        sim.objective = `Home coast · Earth ${Math.max(0, earthAlt / 1_000_000).toFixed(0)} Mm`;
-        if (sim.timeScale < 512) sim.timeScale = 512;
-      }
-    } else if (earthAlt > 160_000) {
-      const targetSpeed = earthAlt > 900_000 ? 5_200 : earthAlt > 400_000 ? 4_100 : 2_900;
-      desired = retrogradeHeading(sim.vx, sim.vy);
-      throttle = speedNow > targetSpeed ? 1 : 0;
-      sim.objective = `Earth braking · ${fmtKm(earthAlt)} · ${speedNow.toFixed(0)} m/s`;
-      if (sim.timeScale > 8) sim.timeScale = 8;
-    } else {
-      const mass = stackMass(sim);
-      const tAcc = (sim.upper.thrustVac * sim.upper.engines) / Math.max(1, mass);
-      const gEarth = GM / (r * r);
-      const closing = Math.max(0, -vr);
-      const speedToKill = Math.hypot(closing, vt);
-      const netBrake = Math.max(0.5, tAcc - gEarth);
-      const stopDist = (speedToKill * speedToKill) / (2 * netBrake);
-      const ignitionAlt = Math.max(3_500, stopDist * 1.45 + 2_600);
-      const terminalBurn = earthAlt <= ignitionAlt || vr > 40;
-
-      if (!terminalBurn) {
-        // Let the atmosphere and gravity do the cheap part of the descent.
-        // Holding a commanded sink rate from 100 km down wasted several tonnes
-        // of propellant fighting gravity long before a landing burn was needed.
-        desired = retrogradeHeading(sim.vx, sim.vy);
-        throttle = 0;
-        if (sim.timeScale > 2) sim.timeScale = 2;
-        sim.objective = `Atmospheric descent · ${fmtKm(earthAlt)} · burn in ${fmtKm(earthAlt - ignitionAlt)}`;
-      } else {
-        const targetVr =
-          earthAlt > 8_000 ? -110 :
-          earthAlt > 2_000 ? -38 :
-          earthAlt > 250 ? -9 :
-          -2.5;
-        const landingSettled = Math.abs(vr - targetVr) < 16 && Math.abs(vt) < 16;
-        sim.timeScale = sim.auto && landingSettled && earthAlt > 250 ? 2 : 1;
-        const kRad = earthAlt > 8_000 ? 0.11 : earthAlt > 2_000 ? 0.18 : 0.32;
-        const kTan = earthAlt > 8_000 ? 0.1 : earthAlt > 2_000 ? 0.18 : 0.34;
-        const aRad = gEarth + (targetVr - vr) * kRad;
-        const aTan = -vt * kTan;
-        const ax = ux * aRad + tx * aTan;
-        const ay = uy * aRad + ty * aTan;
-        desired = Math.atan2(ay, ax);
-        throttle = clamp(Math.hypot(ax, ay) / Math.max(0.1, tAcc), 0, 1);
-        maxRate = 1.05;
-        sim.objective = `Earth landing burn · ${fmtKm(earthAlt)} · ${speedNow.toFixed(0)} m/s`;
-      }
+      desired = Math.atan2(dy, dx);
+    } else if (starveIfDry(sim, throttle > 0.05, "Tanks dry on the lunar approach.")) {
+      throttle = 0;
     }
   }
+
   if (!sim.auto) {
     sim.apStatus = "";
   } else if (Math.abs(manualPitch) >= 0.08) {
@@ -1099,9 +916,7 @@ function guidance(sim: Sim, dt: number, manualPitch: number, manThrot: boolean) 
   } else if (sim.phase === "tli") {
     sim.apStatus = "coast to moon";
   } else if (sim.phase === "lunar") {
-    sim.apStatus = sim.moonLanded ? (sim.config.mission === "home" ? "lunar ascent" : "surface hold") : "landing burn";
-  } else if (sim.phase === "return") {
-    sim.apStatus = altitude(sim.x, sim.y) > 2_000_000 ? "coast to Earth" : "return braking";
+    sim.apStatus = sim.moonLanded ? "holding pitch" : "landing burn";
   } else {
     sim.apStatus = "holding pitch";
   }
@@ -1290,50 +1105,57 @@ function flyBooster(
 
   if (f.phase === "boostback") {
     if (sim.config.recovery === "asds" && f.role === "core") {
-      desired = retro;
-      throttle = spd > 2100 && alt < 90_000 ? 0.7 : 0;
-      if (alt < 80_000) f.phase = "entry";
+      // Aim at the ship, kill leftover east, then hand off to entry.
+      desired = lerpAngle(retro, tgtH, 0.38);
+      const overshoot = dx > 14_000 && vEast > 60;
+      throttle = (spd > 2000 && alt < 95_000) || overshoot ? 0.82 : 0;
+      if (alt < 72_000 || (spd < 1550 && alt < 82_000)) f.phase = "entry";
+      if (f.prop < f.propMax * 0.08) f.phase = "entry";
     } else {
-      desired = lerpAngle(retro, tgtH, 0.55);
+      // RTLS: burn until inbound and predicted miss is small.
+      desired = lerpAngle(tgtH, retro, 0.32);
       throttle = 1;
-      rate = 0.7;
-      if (vEast < -45 || (dx < 9_000 && vEast < 160)) {
+      rate = 0.78;
+      const tFall = Math.sqrt(Math.max(0, (2 * alt) / Math.max(0.4, g)));
+      const predDx = dx + vEast * tFall;
+      const inbound = vEast < 25 && dx < 12_000;
+      const overBurn = vEast < -70 && predDx < 0;
+      if (inbound || overBurn || (predDx < 7_000 && vEast < 70)) {
         f.phase = "coast";
         throttle = 0;
       }
-      if (f.prop < f.propMax * 0.08) f.phase = "coast";
+      if (f.prop < f.propMax * 0.11) f.phase = "coast";
     }
   } else if (f.phase === "coast") {
     desired = retro;
     throttle = 0;
     f.fins = clamp(f.fins + dt, 0, 1);
-    if (alt < 78_000) f.phase = "entry";
+    if (alt < 70_000) f.phase = "entry";
   } else if (f.phase === "entry") {
-    desired = lerpAngle(retro, radial, 0.15);
-    const need = spd > 1400 && alt < 70_000;
-    throttle = need && f.prop > f.propMax * 0.05 ? 0.85 : 0;
-    rate = 0.5;
-    if (alt < 10_500 || spd < 420) f.phase = "landing";
+    desired = lerpAngle(retro, tgtH, 0.22);
+    const need = spd > 1250 && alt < 66_000;
+    throttle = need && f.prop > f.propMax * 0.06 ? 0.9 : 0;
+    rate = 0.55;
+    if (alt < 8_800 || spd < 380) f.phase = "landing";
   } else if (f.phase === "landing") {
     const rh = Math.hypot(f.x, f.y) || 1;
-    const vr =
-      (f.x * f.vx + f.y * f.vy) / rh;
+    const vr = (f.x * f.vx + f.y * f.vy) / rh;
     const down = Math.max(0, -vr);
-    const sd = suicideDist(Math.max(down, spd * 0.55), tAcc, g);
-    const h = Math.max(0, alt - 14);
-    const tilt = clamp(dx / 900, -0.42, 0.42);
+    const sd = suicideDist(Math.max(down, spd * 0.5), tAcc, g);
+    const h = Math.max(0, alt - 12);
+    const tilt = clamp(dx / 480 + vEast / 160, -0.4, 0.4);
     desired = radial + tilt;
-    if (h < sd + 40 || (h < 220 && down > 8)) throttle = 1;
-    else if (h < 80) throttle = clamp((down + 2) / 18, 0.2, 1);
+    if (h < sd + 60 || (h < 190 && down > 10)) throttle = 1;
+    else if (h < 70) throttle = clamp((down + 1.8) / 15, 0.22, 1);
     else throttle = 0;
-    if (h < 40 && down < 12) {
-      desired = radial;
-      throttle = clamp((g * mass) / Math.max(1, maxThrust) + down * 0.04, 0.2, 1);
+    if (h < 32 && down < 14) {
+      desired = radial + clamp(dx / 240, -0.14, 0.14);
+      throttle = clamp((g * mass) / Math.max(1, maxThrust) + down * 0.05, 0.22, 0.95);
     }
-    rate = 0.85;
-    if (h < 90 && Math.abs(dx) < 160 && spd < 90) {
-      const pull = 1.6;
-      f.vx += (0 - (f.vx - east[0] * 0)) * pull * dt;
+    rate = 0.92;
+    if (h < 55 && Math.abs(dx) < 80 && spd < 65) {
+      f.vx -= east[0] * vEast * 2.1 * dt;
+      f.vy -= east[1] * vEast * 2.1 * dt;
     }
   }
 
@@ -1353,8 +1175,8 @@ function groundFlyer(sim: Sim, f: Flyer, spd: number, alt: number) {
   const upright = Math.abs(wrapAngle(f.heading - (radial + Math.PI))) < 0.55
     || Math.abs(wrapAngle(f.heading - radial)) < 0.55;
   const dx = Math.abs(downrange(f.x, f.y) - downrange(f.targetX, f.targetY));
-  const soft = spd < 28 && upright;
-  const near = dx < 280 || (f.role === "core" && dx < 450);
+  const soft = spd < 22 && upright;
+  const near = dx < 200 || (f.role === "core" && dx < 300);
 
   const r = Math.hypot(f.x, f.y);
   const n = R / r;
@@ -1378,6 +1200,12 @@ function groundFlyer(sim: Sim, f: Flyer, spd: number, alt: number) {
     f.heading = radial;
     sim.landings += 1;
     if (sim.ended) sim.ended.landings = sim.landings;
+    if (sim.config.recovery === "asds" && f.role === "core") {
+      noteAsdsLanding();
+    }
+    if (sim.heavy && sim.landings === 1) {
+      noteHeavyRecovery();
+    }
     sim.shake = Math.max(sim.shake, 0.4);
     event(
       sim,
@@ -1399,11 +1227,7 @@ function groundFlyer(sim: Sim, f: Flyer, spd: number, alt: number) {
   f.exploded = true;
   f.alive = false;
   f.phase = "done";
-  // Debris must terminate on impact. Spawning debris from debris creates an
-  // exponential chain when impact happens inside the flyer iteration.
-  if (f.role !== "debris" && f.role !== "fairing") {
-    burstDebris(sim, f.x, f.y, 0, 0, 5);
-  }
+  burstDebris(sim, f.x, f.y, 0, 0, 5);
   if (f.role === "boosterL" || f.role === "boosterR" || f.role === "core") {
     event(sim, f.role.toUpperCase() + " LOST");
   }
@@ -1411,32 +1235,111 @@ function groundFlyer(sim: Sim, f: Flyer, spd: number, alt: number) {
 
 function updateCamera(sim: Sim, dt: number) {
   const alt = altitude(sim.x, sim.y);
-  const t = lookTarget(sim);
-  const vis = clamp(sim.cam.zoomVis, 42, 1.2e8);
-  const err = Math.hypot(t.x - sim.cam.x, t.y - sim.cam.y);
-  // Smooth catch-up — a hard kPos switch at a distance threshold made the view chatter.
-  const frac = clamp(err / Math.max(vis, 40) / 0.4, 0, 1);
-  const kPos = sim.phase === "hangar" ? 4.2 : 6.5 + 10 * frac * frac;
-  if (err > vis * 1.1) {
-    sim.cam.x = t.x;
-    sim.cam.y = t.y;
-  } else {
-    const a = 1 - Math.exp(-kPos * dt);
-    sim.cam.x += (t.x - sim.cam.x) * a;
-    sim.cam.y += (t.y - sim.cam.y) * a;
-  }
-  sim.cam.vis += (vis - sim.cam.vis) * (1 - Math.exp(-9 * dt));
-  if (Math.abs(sim.cam.vis - vis) < vis * 0.003) sim.cam.vis = vis;
+  let tx = sim.x;
+  let ty = sim.y;
+  let leadVx = sim.vx;
+  let leadVy = sim.vy;
+  let applyLead = false;
+  const followFlyer = (role: Flyer["role"]) => {
+    const f = sim.flyers.find((b) => b.role === role && (b.alive || b.landed));
+    if (f) {
+      tx = f.x;
+      ty = f.y;
+      leadVx = f.vx;
+      leadVy = f.vy;
+      applyLead = true;
+      return altitude(f.x, f.y);
+    }
+    return alt;
+  };
 
-  const rolling = Math.abs(sim.cam.roll) > 0.04;
-  const rollOn = sim.follow === "stack" && vis < R * (rolling ? 0.5 : 0.32) && alt > (rolling ? 70_000 : 95_000);
-  const wantRoll = rollOn ? radialHeading(sim.x, sim.y) - Math.PI / 2 : 0;
-  let dRoll = wantRoll - sim.cam.roll;
-  while (dRoll > Math.PI) dRoll -= Math.PI * 2;
-  while (dRoll < -Math.PI) dRoll += Math.PI * 2;
-  sim.cam.roll += dRoll * (1 - Math.exp(-1.05 * dt));
-  if (!rollOn && Math.abs(sim.cam.roll) < 0.003) sim.cam.roll = 0;
-  if (typeof window !== "undefined" && sim.phase === "hangar") {
+  if (sim.follow === "pad") {
+    // Locked on LC-7 looking up — liftoff drama; does not chase the stack.
+    tx = PAD_X;
+    ty = PAD_Y + 220;
+  } else if (sim.follow === "chase") {
+    // Just behind the stack along the trail / velocity.
+    const speed = Math.hypot(sim.vx, sim.vy);
+    const hx = speed > 2 ? sim.vx / speed : -Math.sin(sim.heading);
+    const hy = speed > 2 ? sim.vy / speed : Math.cos(sim.heading);
+    const behind = clamp(speed * 0.28, 48, 520);
+    tx = sim.x - hx * behind;
+    ty = sim.y - hy * behind;
+    applyLead = !sim.clamps;
+    leadVx = sim.vx;
+    leadVy = sim.vy;
+  } else if (sim.follow === "boosterL") followFlyer("boosterL");
+  else if (sim.follow === "boosterR") followFlyer("boosterR");
+  else if (sim.follow === "core") followFlyer("core");
+  else if (sim.follow === "earth") {
+    tx = 0;
+    ty = 0;
+  } else if (sim.follow === "stack") {
+    applyLead = !sim.clamps && sim.phase !== "hangar";
+    leadVx = sim.vx;
+    leadVy = sim.vy;
+  }
+
+  // Speed-scaled velocity lead so zoomed-out / fast coasts keep the subject framed.
+  // Solar and pad never chase the stack.
+  if (applyLead && sim.follow !== "solar" && sim.follow !== "pad" && sim.follow !== "earth") {
+    const speed = Math.hypot(leadVx, leadVy);
+    const lead = clamp(speed * 1.15e-4, 0.06, 0.38);
+    tx += leadVx * lead;
+    ty += leadVy * lead;
+  }
+
+  // Player zoom owns framing. Altitude must not pull the camera away from a close-up.
+  let vis: number;
+  if (sim.follow === "solar") {
+    // Earth–Moon frame — mid-way, slightly Earth-weighted so both discs read clearly.
+    tx = MOON_A * 0.46;
+    ty = 0;
+    vis = clamp(sim.cam.zoomVis, CAM_EARTH_WALL, CAM_SOLAR_MAX);
+  } else if (sim.follow === "earth") {
+    vis = clamp(sim.cam.zoomVis, 80_000, CAM_EARTH_WALL);
+  } else if (sim.follow === "pad") {
+    // Prefer a dramatic close pad frame; player can still zoom out.
+    vis = clamp(sim.cam.zoomVis, CAM_STACK_MIN, CAM_EARTH_WALL);
+  } else {
+    vis = clamp(sim.cam.zoomVis, CAM_STACK_MIN, CAM_EARTH_WALL);
+  }
+
+  let k =
+    sim.follow === "pad"
+      ? 28
+      : sim.follow === "solar" || sim.follow === "earth"
+        ? 14
+        : sim.phase === "hangar"
+          ? 4.2
+          : sim.phase === "ascent"
+            ? 14.5
+            : 11.2;
+
+  // Zoomed-out world-space lag grows with vis — bump follow rate with zoomVis + error.
+  const zoomRef = 310;
+  const zoomVis = Math.max(sim.cam.zoomVis, zoomRef);
+  k *= 1 + clamp((zoomVis / zoomRef - 1) * 0.085, 0, 2.8);
+
+  const err = Math.hypot(tx - sim.cam.x, ty - sim.cam.y);
+  const frameW = Math.max(sim.cam.vis, 1);
+  const errFrames = err / frameW;
+  k *= 1 + clamp(errFrames * 0.9, 0, 4);
+  // Snap harder when the subject has slipped more than ~N frame widths.
+  if (errFrames > 2.4) k = Math.max(k, 72);
+  else if (errFrames > 1.35) k = Math.max(k, 36);
+
+  const alpha = 1 - Math.exp(-k * dt);
+  sim.cam.x += (tx - sim.cam.x) * alpha;
+  sim.cam.y += (ty - sim.cam.y) * alpha;
+  sim.cam.vis += (vis - sim.cam.vis) * (1 - Math.exp(-12 * dt));
+
+  const wantRoll =
+    alt > 80_000 && (sim.follow === "stack" || sim.follow === "chase")
+      ? radialHeading(sim.x, sim.y) - Math.PI / 2
+      : 0;
+  sim.cam.roll += (wantRoll - sim.cam.roll) * (1 - Math.exp(-1.4 * dt));
+  if (typeof window !== "undefined" && sim.phase === "hangar" && sim.follow === "stack") {
     sim.cam.offsetX = 0;
     sim.cam.offsetY = sim.hangarOpen
       ? -Math.min(200, window.innerHeight * 0.22)
@@ -1448,28 +1351,44 @@ function updateCamera(sim: Sim, dt: number) {
   sim.shake = Math.max(0, sim.shake - dt * 1.35);
 }
 
-export function applyCamZoom(sim: Sim, zoomSteps: number, zoomHold: number, dt: number, pinchMul = 1) {
+export function applyCamZoom(sim: Sim, zoomSteps: number, zoomHold: number, dt: number) {
   let v = sim.cam.zoomVis;
-  const rate = 2.7 + Math.log10(Math.max(v, 80) / 80) * 1.55;
+  const prev = v;
   if (zoomSteps) {
-    const steps = Math.max(-12, Math.min(12, zoomSteps));
-    v *= steps > 0 ? Math.pow(1.32, steps) : Math.pow(0.76, -steps);
+    const steps = Math.max(-8, Math.min(8, zoomSteps));
+    v *= steps > 0 ? Math.pow(1.24, steps) : Math.pow(0.78, -steps);
   }
-  if (zoomHold) v *= Math.exp(zoomHold * rate * dt);
-  if (pinchMul > 0 && pinchMul !== 1 && Number.isFinite(pinchMul)) v *= pinchMul;
-  sim.cam.zoomVis = clamp(v, 42, 1.2e8);
-  sim.cam.zoomMul = sim.cam.zoomVis / 310;
+  if (zoomHold) v *= Math.exp(zoomHold * 2.05 * dt);
+  const zoomingOut = v > prev + 1;
+  const zoomingIn = v < prev - 1;
 
-  const zoomingIn = zoomHold < 0 || zoomSteps < 0 || pinchMul < 0.98;
-  if (zoomingIn && sim.follow === "earth" && sim.cam.zoomVis < R * 0.7) {
-    sim.cam.savedZoom.earth = Math.max(sim.cam.zoomVis, R * 2.2);
-    sim.follow = "stack";
-    sim.cam.savedZoom.stack = sim.cam.zoomVis;
+  if (sim.follow === "solar") {
+    if (zoomingIn && v <= CAM_EARTH_WALL * 1.02) {
+      sim.follow = "earth";
+      v = CAM_EARTH_WALL;
+    } else {
+      // Hard stop at the Earth–Moon frame — input is not eaten at the Earth wall.
+      v = clamp(v, CAM_EARTH_WALL, CAM_SOLAR_MAX);
+    }
+  } else if (zoomingOut && v > CAM_EARTH_WALL) {
+    sim.follow = "solar";
+    if (prev <= CAM_EARTH_WALL) {
+      v = CAM_EARTH_WALL * 1.12;
+      event(sim, "SOLAR MAP");
+    }
+    v = clamp(v, CAM_EARTH_WALL, CAM_SOLAR_MAX);
+  } else {
+    v = clamp(v, CAM_STACK_MIN, CAM_EARTH_WALL);
+    if (zoomingIn && sim.follow === "earth") sim.follow = "stack";
   }
+
+  sim.cam.zoomVis = v;
+  sim.cam.zoomMul = sim.cam.zoomVis / 310;
 }
 
+
 function scenarioTick(sim: Sim, dt: number) {
-  const scenario = sim.config.scenario;
+  const scenario = sim.config.scenario ?? "nominal";
   if (scenario === "nominal" || sim.phase === "hangar" || sim.phase === "countdown" || sim.ended) return;
 
   if (scenario === "engine-out" && !sim.scenarioTriggered && sim.t >= 55 && sim.core.attached && sim.core.engines > 1) {
@@ -1477,18 +1396,16 @@ function scenarioTick(sim: Sim, dt: number) {
     sim.scenarioTriggered = true;
     sim.shake = Math.max(sim.shake, 0.72);
     event(sim, "ENGINE OUT · CORE");
-    sim.objective = "Engine out · continue mission on remaining thrust";
+    sim.objective = "Engine out · continue on remaining thrust";
   }
 
   if (scenario === "prop-leak") {
     if (!sim.scenarioTriggered && sim.t >= 35) {
       sim.scenarioTriggered = true;
       event(sim, "PROPELLANT LEAK");
-      sim.objective = "Propellant leak · protect margin and complete the mission";
+      sim.objective = "Propellant leak · protect margin";
     }
     if (sim.scenarioTriggered) {
-      // Deliberately survivable: enough loss to matter to score/mission margin,
-      // but not enough to turn a selected challenge into a coin flip.
       if (sim.core.attached) sim.core.prop = Math.max(0, sim.core.prop - 30 * dt);
       else if (sim.upper.attached) sim.upper.prop = Math.max(0, sim.upper.prop - 4.5 * dt);
     }
@@ -1497,12 +1414,15 @@ function scenarioTick(sim: Sim, dt: number) {
   if (scenario === "rcs-degraded" && !sim.scenarioTriggered && sim.config.mission === "dock" && sim.phase === "orbit") {
     sim.scenarioTriggered = true;
     event(sim, "RCS DEGRADED");
-    sim.objective = "RCS degraded · close gently and match station velocity";
+    sim.objective = "RCS degraded · close gently";
   }
 }
 
 export function stepSim(sim: Sim, dt: number, act: Actions) {
   if (sim.ended && !sim.ended.success) {
+    sim.paused = true;
+    sim.throttle = 0;
+    sim.enginesLit = false;
     updateCamera(sim, dt);
     return;
   }
@@ -1535,12 +1455,6 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     act.throttleMax ||
     act.throttleCut ||
     act.throttleAbs != null;
-
-  // Manual throttle is a temporary override while autopilot is engaged.
-  // The old latch stayed true after the player released W/S or the touch lever,
-  // silently preventing guidance from commanding throttle for the rest of the
-  // flight. Manual guidance still keeps the throttle where the pilot leaves it.
-  if (sim.auto && !manThrot) sim.throttleHold = false;
 
   if (manThrot && sim.phase !== "countdown") {
     const prevTh = sim.throttle;
@@ -1575,7 +1489,11 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     // Density bias replaces the old high-Q fade that fought vacuum authority.
     const atm = clamp(density(alt) / 1.225, 0, 1);
     const altAuth = 0.58 + 0.62 * (1 - atm); // ~0.58 pad → ~1.20 vacuum
-    const target = manPitch * baseRate * altAuth;
+    const rcsCut =
+      sim.config.scenario === "rcs-degraded" && sim.scenarioTriggered && sim.phase === "orbit"
+        ? 0.48
+        : 1;
+    const target = manPitch * baseRate * altAuth * vehicleFeel(sim.config.vehicle).pitchMul * rcsCut;
     const ramp = 1 - Math.exp(-15 * dt);
     sim.omega += (target - sim.omega) * ramp;
   }
@@ -1598,8 +1516,6 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     sim.t += dt;
   }
 
-  scenarioTick(sim, dt);
-
   if (
     sim.upperIgniteAt > 0 &&
     sim.t >= sim.upperIgniteAt &&
@@ -1613,8 +1529,10 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     event(sim, "UPPER IGNITION");
   }
 
-  if (sim.auto) guidance(sim, dt, manPitch, manThrot);
-  else if (Math.abs(manPitch) <= 0.08) sim.omega *= Math.max(0, 1 - dt * 2.35);
+  if (sim.auto) {
+    sim.autopilotUsed = true;
+    guidance(sim, dt, manPitch, manThrot);
+  } else if (Math.abs(manPitch) <= 0.08) sim.omega *= Math.max(0, 1 - dt * 2.35);
 
   sim.heading += sim.omega * dt;
   if (!Number.isFinite(sim.heading)) {
@@ -1635,6 +1553,27 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
   consume(sim.boosterR, thR.mdot, dt);
   consume(sim.core, thC.mdot, dt);
   consume(sim.upper, thU.mdot, dt);
+
+  if (liveProp(sim) <= 1 && sim.enginesLit) {
+    const burning =
+      (sim.phase === "lunar" && !sim.moonLanded) ||
+      sim.phase === "circularize" ||
+      (sim.phase === "orbit" && (sim.config.mission === "lunar" || sim.config.mission === "home") && sim.throttle > 0.05);
+    if (burning) {
+      starveIfDry(
+        sim,
+        true,
+        sim.phase === "lunar"
+          ? "Tanks dry on the lunar approach."
+          : sim.phase === "circularize"
+            ? "Upper stage dry before circularization."
+            : "Dry during the trans-lunar burn.",
+      );
+    } else {
+      sim.enginesLit = false;
+      if (sim.throttle > 0) sim.throttle = 0;
+    }
+  }
 
   if (sim.clamps) {
     const weight = mass * localG(sim.x, sim.y);
@@ -1665,6 +1604,10 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     sim.q = next.q;
     sim.heatFlux = next.flux;
     sim.heatLoad += next.flux * dt;
+    if (!sanitizeSim(sim)) {
+      updateCamera(sim, dt);
+      return;
+    }
   } else {
     sim.vx = 0;
     sim.vy = 0;
@@ -1681,6 +1624,7 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
   atmoAlerts(sim, alt);
   pullMoon(sim, dt);
   tickStation(sim, dt);
+  scenarioTick(sim, dt);
   missionTick(sim, dt, alt, speed);
 
   sim.peakAlt = Math.max(sim.peakAlt, alt);
@@ -1701,8 +1645,7 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     else explodeStack(sim, "Stack settled back onto the pad.");
   }
 
-  const thermalLimit = sim.config.mission === "home" && sim.homebound ? 1.8e7 : 5.5e6;
-  if (sim.heatFlux > thermalLimit && alt < 70_000) {
+  if (sim.heatFlux > 5.5e6 && alt < 70_000) {
     explodeStack(sim, "Aeroheating exceeded the thermal limit.");
   }
 
@@ -1720,18 +1663,22 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
 
   if (sim.phase === "orbit") {
     sim.deployTimer += dt;
-    const autoDeploy =
-      sim.config.mission === "deploy" ||
-      (sim.config.mission === "gto" && sim.gtoComplete);
-    if (autoDeploy && !sim.payloadDeployed && sim.deployTimer > 4.5) deployPayload(sim);
+    if (!sim.payloadDeployed && sim.deployTimer > 4.5) deployPayload(sim);
+  }
+
+  if (sim.gto && sim.phase !== "orbit" && sim.phase !== "ended") {
+    const el = orbitElements(sim.x, sim.y, sim.vx, sim.vy);
+    if (el.apoAlt > 30_000_000 && el.periAlt > 160_000) {
+      sim.phase = "orbit";
+      event(sim, "SECO · GTO");
+    }
   }
 
   if (sim.phase === "ascent" && !sim.core.attached) {
     const el = orbitElements(sim.x, sim.y, sim.vx, sim.vy);
-    if (el.periAlt > sim.targetPeri * 0.95 && el.apoAlt > sim.targetApo * 0.75 && alt > 130_000) {
+    if (!sim.gto && el.periAlt > 170_000 && el.apoAlt > sim.targetApo * 0.7 && alt > 140_000) {
       sim.phase = "orbit";
-      sim.throttle = 0;
-      event(sim, "SECO-2 · PARKING ORBIT");
+      event(sim, "SECO-2");
     }
   }
 
@@ -1739,20 +1686,29 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
     sim.timeScale = 8;
   }
 
-  if (sim.t > 1_200 && sim.config.mission !== "lunar" && sim.config.mission !== "home" && sim.phase !== "orbit" && sim.phase !== "ended") {
+  if (
+    sim.t > 1_200 &&
+    sim.phase !== "orbit" &&
+    sim.phase !== "ended" &&
+    sim.phase !== "tli" &&
+    sim.phase !== "lunar"
+  ) {
     const el = orbitElements(sim.x, sim.y, sim.vx, sim.vy);
     if (el.periAlt > 160_000) {
       sim.phase = "orbit";
       event(sim, "ORBIT");
+    } else if (
+      (sim.phase === "coast" || sim.phase === "circularize") &&
+      el.periAlt > 100_000 &&
+      sim.t < 4_000
+    ) {
+      /* still circularizing on a high ellipse — allow multi-pass to next apo */
     } else {
       explodeStack(sim, "Did not reach a stable orbit.");
     }
   }
 
-  // Iterate a stable snapshot: impact effects can append new debris flyers.
-  // Processing appended flyers in the same tick used to create a runaway
-  // debris chain and eventually exhaust memory.
-  for (const f of sim.flyers.slice()) stepFlyer(sim, f, dt);
+  for (const f of sim.flyers) stepFlyer(sim, f, dt);
   const recovering = sim.flyers.some(
     (f) =>
       (f.role === "boosterL" || f.role === "boosterR" || f.role === "core") &&
@@ -1761,6 +1717,8 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
       altitude(f.x, f.y) < 90_000,
   );
   if (recovering && sim.timeScale > 2) sim.timeScale = 2;
+  const warpCap = maxWarpFor(sim);
+  if (sim.timeScale > warpCap) sim.timeScale = warpCap;
   if (sim.flyers.length > 36) {
     sim.flyers = sim.flyers.filter((f) => f.alive || f.landed || f.age < 8);
     if (sim.flyers.length > 36) sim.flyers.length = 36;
@@ -1770,7 +1728,7 @@ export function stepSim(sim: Sim, dt: number, act: Actions) {
 }
 
 function QUALITY_TRAIL() {
-  return getSettings().quality === "low" ? 180 : getSettings().quality === "high" ? 900 : 480;
+  return QUALITY[getSettings().quality].trail;
 }
 
 export function moonPos(): { x: number; y: number } {
@@ -1825,13 +1783,12 @@ function pullMoon(sim: Sim, dt: number) {
         explodeStack(sim, "Hard lunar impact.");
       } else {
         sim.moonLanded = true;
-        sim.moonTouchdownAt = sim.t;
         sim.clamps = true;
         sim.vx = 0;
         sim.vy = 0;
         sim.throttle = 0;
         event(sim, "LUNAR TOUCHDOWN");
-        sim.objective = sim.config.mission === "home" ? "Touchdown · ascent in 3 seconds" : "Lunar landing complete";
+        sim.objective = sim.config.mission === "home" ? "Lift off and return home" : "Lunar landing complete";
         if (sim.config.mission === "lunar") {
           success(sim, "Lunar landing", "Soft touchdown on the near side.");
         }
@@ -1858,7 +1815,6 @@ function missionTick(sim: Sim, dt: number, alt: number, speed: number) {
 
   if (sim.moonLanded && m === "home" && sim.clamps && sim.throttle > 0.55 && sim.enginesLit) {
     sim.clamps = false;
-    sim.homebound = true;
     event(sim, "LUNAR LIFTOFF");
     sim.objective = "Escape the Moon, then enter Earth";
   }
@@ -1870,80 +1826,35 @@ function missionTick(sim: Sim, dt: number, alt: number, speed: number) {
     const n = Math.sqrt(GM / Math.pow(R + 400_000, 3));
     const r = R + 400_000;
     const ang = Math.atan2(sim.stationY, sim.stationX);
-    // Station angle decreases (clockwise), so its inertial velocity follows
-    // +sin(theta), -cos(theta). The old sign reported ~15 km/s false closing.
-    const svx = Math.sin(ang) * n * r;
-    const svy = -Math.cos(ang) * n * r;
-    let rel = Math.hypot(sim.vx - svx, sim.vy - svy);
-
-    if (sim.auto && dist > 1 && dist < 2_500_000) {
-      // The rendezvous computer can safely accelerate the long closing phase.
-      // Keep the final 300 m in real time so docking still feels deliberate.
-      sim.timeScale = dist > 20_000 ? 8 : dist > 2_000 ? 4 : dist > 180 ? 2 : 1;
-      // Halo's rendezvous computer uses capsule RCS to match Station Aurora.
-      // This is intentionally assisted gameplay: fast closing while distant,
-      // then a progressively softer target speed in the docking corridor.
-      const ux = (sim.stationX - sim.x) / dist;
-      const uy = (sim.stationY - sim.y) / dist;
-      const closing =
-        dist > 2_000_000 ? 900 :
-        dist > 500_000 ? 450 :
-        dist > 100_000 ? 170 :
-        dist > 20_000 ? 65 :
-        dist > 2_000 ? 16 :
-        dist > 300 ? 3.5 :
-        1.5;
-      const targetVx = svx + ux * closing;
-      const targetVy = svy + uy * closing;
-      const evx = targetVx - sim.vx;
-      const evy = targetVy - sim.vy;
-      const err = Math.hypot(evx, evy);
-      const rcsFactor = sim.config.scenario === "rcs-degraded" ? 0.48 : 1;
-      const maxAcc = (
-        dist > 500_000 ? 2.4 :
-        dist > 100_000 ? 1.4 :
-        dist > 20_000 ? 0.75 :
-        dist > 2_000 ? 0.38 :
-        0.16
-      ) * rcsFactor;
-      if (err > 0.01) {
-        const dv = Math.min(err, maxAcc * dt);
-        sim.vx += (evx / err) * dv;
-        sim.vy += (evy / err) * dv;
-      }
-      rel = Math.hypot(sim.vx - svx, sim.vy - svy);
-      sim.apStatus = dist > 2_000 ? "RCS rendezvous" : "final approach";
-    }
-
-    sim.objective = `Aurora ${Math.round(dist)} m · Δv ${rel.toFixed(1)} m/s`;
-    if (dist < 150 && rel < 18) {
+    const svx = -Math.sin(ang) * n * r;
+    const svy = Math.cos(ang) * n * r;
+    const rel = Math.hypot(sim.vx - svx, sim.vy - svy);
+    sim.objective = `Aurora ${Math.round(dist)} m · Δv ${rel.toFixed(0)} m/s`;
+    if (dist < 160 && rel < 18) {
       sim.docked = true;
       success(sim, "Docked", "Hard dock with Station Aurora. Hatches equalizing.");
     }
   }
 
-  if (m === "leo" && sim.phase === "orbit" && el.periAlt > 160_000 && sim.deployTimer > 2.5) {
-    success(
-      sim,
-      "Orbit confirmed",
-      `Stable orbit. Apo ${(el.apoAlt / 1000).toFixed(0)} km · peri ${(el.periAlt / 1000).toFixed(0)} km.`,
-    );
-  }
-  if (
-    m === "gto" &&
-    sim.phase === "orbit" &&
-    sim.gtoComplete &&
-    el.apoAlt > DESTINATIONS.gto.apo * 0.94 &&
-    el.periAlt > 145_000 &&
-    sim.deployTimer > 2.5
-  ) {
-    success(sim, "GTO injection", "Farin Probe is committed to geostationary transfer.");
+  if ((m === "leo" || m === "gto") && sim.phase === "orbit" && sim.deployTimer > 6.5) {
+    // Orbit insert requires peri above the 160 km career gate (AP must not SECO short).
+    if (m === "leo" && !(el.periAlt > 160_000)) {
+      /* keep flying / circularizing until peri clears */
+    } else {
+      success(
+        sim,
+        m === "gto" ? "GTO injection" : "Orbit confirmed",
+        m === "gto"
+          ? "Geostationary transfer complete."
+          : `Stable orbit. Apo ${(el.apoAlt / 1000).toFixed(0)} km · peri ${(el.periAlt / 1000).toFixed(0)} km.`,
+      );
+    }
   }
   if (m === "deploy" && sim.payloadDeployed && sim.phase === "orbit") {
     success(sim, "Relay deployed", "Meridian Relay is on station.");
   }
 
-  if (m === "home" && sim.homebound && !sim.clamps && alt < 40 && speed < 22 && sim.body === "earth") {
+  if (m === "home" && sim.moonLanded && !sim.clamps && alt < 40 && speed < 22 && sim.body === "earth") {
     success(sim, "Home", "Lunar crew is back on Earth.");
   }
 
@@ -1979,49 +1890,10 @@ export function snapshot(sim: Sim): HudSnapshot {
   });
   const inOrbit = el.periAlt > 160_000 && !el.hyperbolic;
   const radial = radialHeading(sim.x, sim.y);
-  const rx = Math.cos(radial);
-  const ry = Math.sin(radial);
-  const tx = -ry;
-  const ty = rx;
-  const verticalSpeed = sim.vx * rx + sim.vy * ry;
-  const horizontalSpeed = sim.vx * tx + sim.vy * ty;
   const fromUp = wrapAngle(sim.heading - radial);
   const pitchDeg = ((Math.PI / 2 - fromUp) * 180) / Math.PI;
-  const velHeading = Math.atan2(sim.vy, sim.vx);
-  const velFromUp = wrapAngle(velHeading - radial);
-  const progradePitchDeg = ((Math.PI / 2 - velFromUp) * 180) / Math.PI;
-  const dockDistance = sim.config.mission === "dock"
-    ? Math.hypot(sim.x - sim.stationX, sim.y - sim.stationY)
-    : null;
-  const dockRelativeSpeed = sim.config.mission === "dock"
-    ? (() => {
-        const stationR = Math.hypot(sim.stationX, sim.stationY);
-        const stationV = Math.sqrt(GM / Math.max(R + 1, stationR));
-        // Aurora propagates clockwise (angle decreases), so its tangent is
-        // +sin(theta), -cos(theta). Keep HUD telemetry on the same convention
-        // as the rendezvous controller or the player sees a false ~15 km/s Δv.
-        const stVx = (sim.stationY / stationR) * stationV;
-        const stVy = (-sim.stationX / stationR) * stationV;
-        return Math.hypot(sim.vx - stVx, sim.vy - stVy);
-      })()
-    : null;
-  let fuelName = sim.payloadKind === "tug" ? "Lunar Tug" : "Upper";
+  let fuelName = "Upper";
   let fuelFrac = sim.upper.prop / sim.upper.propMax;
-  let missionProgress = 0;
-  if (sim.ended?.success) missionProgress = 1;
-  else if (sim.phase === "countdown") missionProgress = 0.04;
-  else if (sim.phase === "ascent") missionProgress = 0.08 + clamp(alt / 140_000, 0, 1) * 0.27;
-  else if (sim.phase === "coast") missionProgress = 0.42;
-  else if (sim.phase === "circularize") missionProgress = 0.52;
-  else if (sim.config.mission === "leo" && sim.phase === "orbit") missionProgress = 0.9;
-  else if (sim.config.mission === "deploy" && sim.phase === "orbit") missionProgress = sim.payloadDeployed ? 1 : 0.82;
-  else if (sim.config.mission === "gto" && sim.phase === "orbit") missionProgress = sim.gtoComplete ? 0.98 : 0.72;
-  else if (sim.config.mission === "dock" && sim.phase === "orbit") missionProgress = sim.docked ? 1 : 0.72;
-  else if (sim.config.mission === "lunar") {
-    missionProgress = sim.moonLanded ? 1 : sim.phase === "lunar" ? 0.82 : sim.phase === "tli" ? 0.62 : sim.phase === "orbit" ? 0.46 : missionProgress;
-  } else if (sim.config.mission === "home") {
-    missionProgress = sim.ended?.success ? 1 : sim.phase === "return" ? 0.88 : sim.moonLanded ? 0.68 : sim.phase === "lunar" ? 0.58 : sim.phase === "tli" ? 0.42 : sim.phase === "orbit" ? 0.3 : missionProgress;
-  }
   if (sim.boosterL.attached || sim.boosterR.attached) {
     const a = sim.boosterL.attached ? sim.boosterL.prop / sim.boosterL.propMax : 1;
     const b = sim.boosterR.attached ? sim.boosterR.prop / sim.boosterR.propMax : 1;
@@ -2076,107 +1948,24 @@ export function snapshot(sim: Sim): HudSnapshot {
     peakAlt: sim.peakAlt,
     peakSpeed: sim.peakSpeed,
     maxQ: sim.maxQ,
-    missionProgress: clamp(missionProgress, 0, 1),
-    verticalSpeed,
-    horizontalSpeed,
-    progradePitchDeg,
-    dockDistance,
-    dockRelativeSpeed,
-    scenario: sim.config.scenario,
+    missionProgress: (() => {
+      if (sim.ended?.success) return 1;
+      if (sim.phase === "hangar" || sim.phase === "countdown") return 0;
+      if (sim.phase === "ascent") return 0.25;
+      if (sim.phase === "coast" || sim.phase === "circularize") return 0.45;
+      if (sim.phase === "orbit") return sim.config.mission === "dock" && !sim.docked ? 0.72 : 0.85;
+      if (sim.phase === "tli" || sim.phase === "lunar") return 0.9;
+      return 0.3;
+    })(),
+    scenario: sim.config.scenario ?? "nominal",
     scenarioActive: sim.scenarioTriggered,
-    contractId: sim.config.contractId,
-    clamps: sim.clamps,
-    coreAttached: sim.core.attached,
-    boostersAttached: sim.boosterL.attached || sim.boosterR.attached,
-    fairingOn: !sim.fairingJettisoned,
-    payloadDeployed: sim.payloadDeployed,
+    contractId: sim.config.contractId ?? null,
   };
 }
 
 export function engineCount(sim: Sim): number {
   if (!sim.enginesLit) return 0;
   return activeEngines(sim);
-}
-
-/** Projected coasting orbit (+ short burn stub while throttled). */
-export function flightPath(sim: Sim): PredictedPath {
-  const empty: PredictedPath = {
-    points: [],
-    burn: [],
-    apo: null,
-    peri: null,
-    impact: null,
-    apoAlt: NaN,
-    periAlt: NaN,
-    closed: false,
-  };
-  if (sim.phase === "hangar" || sim.clamps || sim.ended) return empty;
-  const lunar = sim.body === "moon";
-  const m = moonPos();
-  const gm = lunar ? MOON_GM : GM;
-  const br = lunar ? MOON_R : R;
-  const ox = lunar ? m.x : 0;
-  const oy = lunar ? m.y : 0;
-  const n = getSettings().quality === "low" ? 72 : getSettings().quality === "high" ? 180 : 120;
-  let coast = sampleConic(sim.x, sim.y, sim.vx, sim.vy, gm, br, ox, oy, n);
-  if (!coast.closed || coast.points.length < 8 || !(coast.periAlt > 90_000)) {
-    coast = sampleBallistic(sim.x, sim.y, sim.vx, sim.vy, gm, br, ox, oy, 560, n);
-  }
-  let burn: PredictedPath["burn"] = [];
-  if (sim.enginesLit && sim.throttle > 0.05) {
-    const alt = altitude(sim.x, sim.y);
-    const th =
-      stageForce(sim.boosterL, alt, sim.throttle).thrust +
-      stageForce(sim.boosterR, alt, sim.throttle).thrust +
-      stageForce(sim.core, alt, sim.core.attached ? sim.throttle : 0).thrust +
-      stageForce(
-        sim.upper,
-        alt,
-        !sim.core.attached && sim.upper.attached && sim.enginesLit ? sim.throttle : 0,
-      ).thrust;
-    const acc = th / stackMass(sim);
-    if (acc > 0.2) {
-      const long = sim.phase === "ascent" || sim.phase === "circularize" || !coast.closed;
-      burn = sampleBurn(
-        sim.x,
-        sim.y,
-        sim.vx,
-        sim.vy,
-        sim.heading,
-        acc,
-        gm,
-        br,
-        ox,
-        oy,
-        long ? 420 : 80,
-        long ? 160 : 64,
-      );
-      // During ascent the useful “where you’re going” line is the powered arc,
-      // not the tiny fall-back-to-Earth coast stub.
-      if (long && burn.length > 8) {
-        let maxR = 0;
-        let apo = burn[0] ?? null;
-        for (const pt of burn) {
-          const rr = Math.hypot(pt.x - ox, pt.y - oy);
-          if (rr > maxR) {
-            maxR = rr;
-            apo = pt;
-          }
-        }
-        coast = {
-          points: burn,
-          apo: maxR - br > 4_000 ? apo : null,
-          peri: null,
-          impact: null,
-          apoAlt: maxR - br,
-          periAlt: coast.periAlt,
-          closed: false,
-        };
-        burn = burn.slice(0, Math.min(36, burn.length));
-      }
-    }
-  }
-  return { ...coast, burn };
 }
 
 export function flipAutopilot(sim: Sim) {
