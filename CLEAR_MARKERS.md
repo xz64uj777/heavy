@@ -2,18 +2,14 @@
 
 Zip sha256: `f18bba2c6c5fc1e0a45884ec16d3cb7875074ebc8369a0b6f7d3fe25001ad3bf`
 
-## Synced on branch `v10`
+## Synced on branch `v10` (byte-accurate vs local CLEAR)
 - APP_NAME / hangar: **Helios Heavy v10**
-- `src/game/progress.ts` — CLEAR (noteMissionDone / career gates) — commit `6a11a6f`
-- Staged CLEAR slices under `scripts/clear-blobs/{render,sim,launch}/` + `scripts/assemble-clear.mjs`
-  - Expected sha256 after assemble:
-    - render.ts `74d4349ef1f75847…`
-    - sim.ts `a6d5c72e89a6648c…`
-    - LaunchSim.tsx `8abbf4f1df4e41be…`
+- `src/game/progress.ts` — `eeeb9d82…` — commit `6a11a6f`
+- `src/game/render.ts` — `74d4349e…` (33362 bytes)
+- `src/game/sim.ts` — `a6d5c72e…` (58633 bytes) — nearApoCirc / upperFrac / deployTimer
+- `src/components/LaunchSim.tsx` — `8abbf4f1…` (48850 bytes)
 
-## Still open (MCP payload limit ~20KB / CallMcpTool)
-- Byte-accurate `src/game/render.ts` (~33KB) — currently TEMP stub (empty draw)
-- Byte-accurate `src/game/sim.ts` (~58KB) — remote still prior Helios (missing nearApoCirc/upperFrac CLEAR)
-- Byte-accurate `src/components/LaunchSim.tsx` (~49KB)
+Assembled by Actions run: https://github.com/xz64uj777/heavy/actions/runs/36186651215  
+Assemble commit: https://github.com/xz64uj777/heavy/commit/79b5751e42cbdfddd8d1bb94216aa68c84b43535
 
-Run locally: `node scripts/assemble-clear.mjs` then MCP-push the three files, or continue grow commits.
+Staging (kept): `scripts/clear-blobs/zip-b64/*.b64` + `scripts/decode-clear-zip.mjs`
