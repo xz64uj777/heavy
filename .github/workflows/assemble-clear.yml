@@ -10,11 +10,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: v10
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Assemble CLEAR blobs
-        run: node scripts/assemble-clear.mjs
+      - name: Decode CLEAR zip b64 and write targets
+        run: node scripts/decode-clear-zip.mjs
       - name: Commit assembled CLEAR
         run: |
           git config user.name "helios-assemble"
