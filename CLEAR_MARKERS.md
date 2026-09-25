@@ -2,14 +2,18 @@
 
 Zip sha256: `f18bba2c6c5fc1e0a45884ec16d3cb7875074ebc8369a0b6f7d3fe25001ad3bf`
 
-## Confirmed on branch `v10`
-- APP_NAME / hangar: **Helios Heavy v10** (`src/routes/__root.tsx`, `src/lib/og/site.json`, `VERSION.txt`)
-- `UPPER_TANK_SCALE = { small: 2.3, ... }` in `src/game/config.ts` (Light upper-only tank)
-- Cleared `package.json` (app-builder-workspace)
-- Router / index / haptic / challenges / preview-host-bridge
-- Commit message theme: Helios Heavy v10 — Player CLEAR (upper-only Light, deployTimer, nearApo)
+## Synced on branch `v10`
+- APP_NAME / hangar: **Helios Heavy v10**
+- `src/game/progress.ts` — CLEAR (noteMissionDone / career gates) — commit `6a11a6f`
+- Staged CLEAR slices under `scripts/clear-blobs/{render,sim,launch}/` + `scripts/assemble-clear.mjs`
+  - Expected sha256 after assemble:
+    - render.ts `74d4349ef1f75847…`
+    - sim.ts `a6d5c72e89a6648c…`
+    - LaunchSim.tsx `8abbf4f1df4e41be…`
 
-## Follow-up (large blobs)
-Full local tree also has updated `src/game/sim.ts` (~58KB), `LaunchSim.tsx` (~49KB), `render.ts`, `progress.ts` with additional CLEAR gates (`nearApoCirc`, `upperFrac`, etc.). Remote `sim.ts` already has `nearApo` + `deployTimer` from prior Helios Heavy; byte-identical sync of those large files may need another push pass.
+## Still open (MCP payload limit ~20KB / CallMcpTool)
+- Byte-accurate `src/game/render.ts` (~33KB) — currently TEMP stub (empty draw)
+- Byte-accurate `src/game/sim.ts` (~58KB) — remote still prior Helios (missing nearApoCirc/upperFrac CLEAR)
+- Byte-accurate `src/components/LaunchSim.tsx` (~49KB)
 
-Local staging commit (not git-pushed): `ffcc1f1` in `/tmp/heavy-git`.
+Run locally: `node scripts/assemble-clear.mjs` then MCP-push the three files, or continue grow commits.

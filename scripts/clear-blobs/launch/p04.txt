@@ -1,0 +1,40 @@
+          }}
+        >
+          <Pause />
+          Pause
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function fmtMet(t: number) {
+  const sign = t < 0 ? "−" : "+";
+  const s = Math.abs(t);
+  const m = Math.floor(s / 60);
+  const sec = s - m * 60;
+  return `T${sign}${String(m).padStart(2, "0")}:${sec.toFixed(1).padStart(4, "0")}`;
+}
+
+function fmtAlt(m: number) {
+  if (!Number.isFinite(m)) return "—";
+  const a = Math.abs(m);
+  if (a < 1e3) return `${m.toFixed(0)} m`;
+  if (a < 1e6) return `${(m / 1e3).toFixed(1)} km`;
+  return `${(m / 1e6).toFixed(2)} Mm`;
+}
+
+function fmtSpeed(v: number) {
+  if (v < 1e3) return `${v.toFixed(0)} m/s`;
+  return `${(v / 1e3).toFixed(2)} km/s`;
+}
+
+function fmtHeat(q: number) {
+  if (q < 1e3) return "cool";
+  if (q < 1e6) return `${(q / 1e3).toFixed(0)} kW`;
+  return `${(q / 1e6).toFixed(1)} MW`;
+}
+
+function clamp01(v: number) {
+  return Math.max(0, Math.min(1, v));
+}
